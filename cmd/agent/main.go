@@ -78,7 +78,7 @@ import (
 // 是否需要我继续为你添加 节点结构 和 多级转发 的逻辑基础？
 
 func main() {
-	conn, err := net.Dial("tcp", "127.0.0.1:9999")
+	conn, err := net.Dial("tcp", "45.89.233.225:9999")
 	if err != nil {
 		panic(err)
 	}
