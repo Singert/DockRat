@@ -132,3 +132,134 @@ stowaway-clone/
 
 如你希望我直接生成一个 **初始框架项目** 或提供部分代码模块（如 TLS 通信、节点管理、传输封装、shell 执行），我可以为你生成。你希望我先从哪个模块开始？
 
+当然可以，我们可以将**复刻 Stowaway 的开发过程分为五个阶段**，每个阶段都明确目标、重点模块和建议技术栈。你只需按部就班，一步步来，项目就能顺利推进。
+
+---
+
+## 🧭 阶段化开发路线
+
+### ✅ **阶段一：基础通信层与最小可用原型 (MVP)**
+
+> **目标**：实现 admin 与 agent 之间的 TCP 通信和命令交互，最简单的远程命令执行（shell）
+
+#### ✔ 你要实现的功能：
+
+* `admin`：监听端口，等待连接
+* `agent`：主动连接 admin
+* 双向 TCP 通信：基于自定义协议传输命令和结果
+* 执行远程命令（用 `bash -c`）并返回结果
+
+#### 📁 模块目录建议：
+
+```bash
+core/
+  ├── protocol/       # 协议定义（结构体 + 编码/解码）
+  ├── shell/          # 执行命令并返回输出
+cmd/
+  ├── stowaway_admin/
+  └── stowaway_agent/
+```
+
+#### 🧱 技术点建议：
+
+* `net.Conn` 基础通信（TCP）
+* `encoding/gob` 或 `encoding/json` 实现简单的消息结构封装
+* `bufio.Reader/Writer` 实现数据读写
+* `os/exec` 运行命令并收集输出
+
+---
+
+### ✅ **阶段二：多级节点与命令系统设计**
+
+> **目标**：agent 可以作为中转节点，连接新的 agent，形成**树形结构**
+
+#### ✔ 你要实现的功能：
+
+* 每个节点可以转发数据给它的父节点或子节点
+* `use` 命令切换控制的节点
+* `connect` 命令让一个节点连接另一个 agent
+
+#### 📁 新增模块：
+
+```bash
+core/
+  ├── node/           # 节点结构与树管理
+  ├── router/         # 节点路由与转发
+```
+
+#### 🧠 技术点：
+
+* 节点分配 ID，维护父子结构
+* 每个连接都要有 metadata：ID、父子关系、状态
+* 路由模块实现从 admin -> node1 -> node2 -> node3 的链式消息转发
+
+---
+
+### ✅ **阶段三：Socks5、Shell、File 等服务功能**
+
+> **目标**：实现 socks5 代理、远程 shell、上传下载等关键服务
+
+#### ✔ 你要实现的功能：
+
+* 远程命令执行交互模式
+* 文件上传/下载（可用分块流式传输）
+* 本地启动 socks5，转发给 agent 出口访问
+
+#### 🧠 技术点：
+
+* `socks5`: 用现成的 [xtaci/smux](https://github.com/xtaci/smux) 或自己实现简单版本
+* shell：利用 pty 提供交互式 shell
+* 文件：`io.Copy` + metadata 描述传输流
+
+---
+
+### ✅ **阶段四：加密与协议切换支持**
+
+> **目标**：通信支持 TLS、AES-GCM、HTTP/WS 模式切换
+
+#### ✔ 你要实现的功能：
+
+* TLS 握手（双向）
+* AES-GCM 加密解密
+* WS/HTTP 伪装为应用层流量（套在 TCP 上）
+
+#### 🧠 技术点：
+
+* TLS：`crypto/tls`
+* AES：`crypto/aes`, `crypto/cipher`
+* WebSocket：`golang.org/x/net/websocket` 或 `nhooyr.io/websocket`
+
+---
+
+### ✅ **阶段五：CLI交互界面与完整控制面板**
+
+> **目标**：实现 admin 的完整命令行操作界面（支持补全、历史记录）
+
+#### ✔ 你要实现的功能：
+
+* 命令面板 (`help`, `use`, `listen`, `ssh`, `connect`, `upload`, `forward`, …)
+* 面板切换（admin主界面 <=> node控制面板）
+* 状态跟踪、进度条显示、错误反馈
+
+#### 推荐使用的库：
+
+* [c-bata/go-prompt](https://github.com/c-bata/go-prompt)：提供高级命令行交互
+* 或者自己实现：用 `bufio.Scanner` 处理命令输入 + 手动 dispatch 命令
+
+---
+
+## 🔨 建议你先做的第一步（立即可做）
+
+创建最小可用原型，实现最简单的 admin/agent TCP 通信 + 远程执行命令：
+
+```
+admin: ./stowaway_admin -l 9999
+agent: ./stowaway_agent -c 127.0.0.1:9999
+```
+
+1. 我可以直接给你写出这个部分的完整代码结构
+2. 然后你就可以在终端里看到：admin 发一条命令，agent 执行后返回结果 ✅
+
+---
+
+是否现在就从「**阶段一：admin 和 agent 的远程命令执行**」这个最小原型开始？我可以立刻给你生成对应的代码框架。你希望先实现哪种：命令单发返回，还是持续交互式 shell？
