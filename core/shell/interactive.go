@@ -4,7 +4,6 @@ package shell
 import (
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 
@@ -28,22 +27,22 @@ func StartShellIO(conn io.ReadWriter, shell string) error {
 	return nil
 }
 
-func handleInteractive(conn net.Conn) {
-	fmt.Println("[*] Switched to interactive shell. Press Ctrl+C to exit.")
+// func handleInteractive(conn net.Conn) {
+// 	fmt.Println("[*] Switched to interactive shell. Press Ctrl+C to exit.")
 
-	done := make(chan struct{})
+// 	done := make(chan struct{})
 
-	// admin -> agent (stdin -> conn)
-	go func() {
-		_, _ = io.Copy(conn, os.Stdin)
-		done <- struct{}{}
-	}()
+// 	// admin -> agent (stdin -> conn)
+// 	go func() {
+// 		_, _ = io.Copy(conn, os.Stdin)
+// 		done <- struct{}{}
+// 	}()
 
-	// agent -> admin (conn -> stdout)
-	go func() {
-		_, _ = io.Copy(os.Stdout, conn)
-		done <- struct{}{}
-	}()
+// 	// agent -> admin (conn -> stdout)
+// 	go func() {
+// 		_, _ = io.Copy(os.Stdout, conn)
+// 		done <- struct{}{}
+// 	}()
 
-	<-done // wait for either direction to close
-}
+// 	<-done // wait for either direction to close
+// }
