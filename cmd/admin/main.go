@@ -15,10 +15,8 @@ import (
 	"io"
 	"net"
 	"os"
-	"os/exec"
 
 	"github.com/Singert/DockRat/core/protocol"
-	"github.com/creack/pty"
 )
 
 // func main() {
@@ -151,22 +149,22 @@ func main() {
 
 // ✅ 新增函数：使用 pty 模拟 admin 本地终端，连接远程 shell
 func startInteractiveShell(conn net.Conn) {
-	// 创建本地 pty 会话
-	cmd := exec.Command("cat") // 一个保持运行的进程
-	ptmx, err := pty.Start(cmd)
-	if err != nil {
-		panic(err)
-	}
-	defer func() {
-		_ = ptmx.Close()
-		_ = cmd.Process.Kill()
+	fmt.Fprintln(os.Stderr, "[*] Shell session started. Press Ctrl+C to exit.")
+
+	// 双向桥接 conn <=> admin 的控制台
+	done := make(chan struct{})
+
+	// 用户输入 -> 发送给 agent shell
+	go func() {
+		_, _ = io.Copy(conn, os.Stdin)
+		done <- struct{}{}
 	}()
 
-	// 将 admin 终端输入输出 → 本地 pty
-	go io.Copy(ptmx, os.Stdin)
-	go io.Copy(os.Stdout, ptmx)
+	// agent shell 输出 -> 显示在 admin 控制台
+	go func() {
+		_, _ = io.Copy(os.Stdout, conn)
+		done <- struct{}{}
+	}()
 
-	// 将本地 pty 与 agent 的 shell 双向绑定
-	go io.Copy(conn, ptmx) // 本地 pty 输出 → agent shell 输入
-	io.Copy(ptmx, conn)    // agent shell 输出 → 本地 pty 输入
+	<-done // 任一方向断开则退出
 }
