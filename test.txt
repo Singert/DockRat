@@ -1,0 +1,13 @@
+agent_shell_debug.go
+cmd
+core
+go.mod
+go.sum
+LICENSE
+Makefile
+output.txt
+pkg
+README.md
+script
+test.go
+test.txt

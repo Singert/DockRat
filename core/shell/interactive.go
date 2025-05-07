@@ -11,8 +11,13 @@ import (
 )
 
 func StartShellIO(conn io.ReadWriter, shell string) error {
-	cmd := exec.Command(shell)
-	ptmx, err := pty.Start(cmd)
+	cmd := exec.Command("bash", "-i")
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	// ✅ 设置初始窗口大小：常规 80x24
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{
+		Rows: 24,
+		Cols: 80,
+	})
 	if err != nil {
 		return err
 	}

