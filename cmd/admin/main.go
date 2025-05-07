@@ -106,18 +106,17 @@ import (
 // 				done <- struct{}{}
 // 			}()
 
-// 			<-done // 任一方向断开就退出
-// 			break
-// 		}
-// 	}
-// }
-
+//				<-done // 任一方向断开就退出
+//				break
+//			}
+//		}
+//	}
 func main() {
 	ln, err := net.Listen("tcp", ":9999")
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("[*] Waiting for agent to connect...")
+	fmt.Println("[*] Waiting for agent...")
 
 	conn, err := ln.Accept()
 	if err != nil {
@@ -125,7 +124,6 @@ func main() {
 	}
 	defer conn.Close()
 	fmt.Println("[*] Agent connected.")
-	fmt.Println("[*] Enter 'shell' to start interactive session.")
 
 	stdin := bufio.NewScanner(os.Stdin)
 	for {
@@ -135,36 +133,27 @@ func main() {
 		}
 		line := stdin.Text()
 		if line == "shell" {
-			// 发送进入 shell 模式的请求
 			msg := protocol.NewCommand("")
 			data, _ := protocol.EncodeWithNewline(msg)
 			conn.Write(data)
-
-			fmt.Println("[*] Switched to interactive shell. Press Ctrl+C or 'exit' to quit.")
+			fmt.Println("[*] Switched to interactive shell. Press Ctrl+C to quit.")
 			startInteractiveShell(conn)
-			break
+			fmt.Println("[*] Returned from shell session.")
+			continue
 		}
+		fmt.Println("Unknown command. Try 'shell'.")
 	}
 }
 
-// ✅ 新增函数：使用 pty 模拟 admin 本地终端，连接远程 shell
 func startInteractiveShell(conn net.Conn) {
-	fmt.Fprintln(os.Stderr, "[*] Shell session started. Press Ctrl+C to exit.")
-
-	// 双向桥接 conn <=> admin 的控制台
 	done := make(chan struct{})
-
-	// 用户输入 -> 发送给 agent shell
 	go func() {
 		_, _ = io.Copy(conn, os.Stdin)
 		done <- struct{}{}
 	}()
-
-	// agent shell 输出 -> 显示在 admin 控制台
 	go func() {
 		_, _ = io.Copy(os.Stdout, conn)
 		done <- struct{}{}
 	}()
-
-	<-done // 任一方向断开则退出
+	<-done
 }
