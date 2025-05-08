@@ -132,6 +132,7 @@ func main() {
 			break
 		}
 		line := stdin.Text()
+		fmt.Println("[*] Sending command:", line)
 		if line == "shell" {
 			msg := protocol.NewCommand("")
 			data, _ := protocol.EncodeWithNewline(msg)
@@ -150,6 +151,7 @@ func startInteractiveShell(conn net.Conn) {
 	go func() {
 		_, _ = io.Copy(conn, os.Stdin)
 		done <- struct{}{}
+		fmt.Println()
 	}()
 	go func() {
 		_, _ = io.Copy(os.Stdout, conn)

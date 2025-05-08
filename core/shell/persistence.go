@@ -28,7 +28,7 @@ func AttachInteractiveSession(conn io.ReadWriter) error {
 	}
 
 	fmt.Fprintln(persistentShell.ptmx, "echo '[*] Attached to shell.'")
-
+	fmt.Fprintln(persistentShell.ptmx, "pwd")
 	done := make(chan struct{})
 
 	// Admin -> Shell
