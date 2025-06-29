@@ -8,6 +8,7 @@ import (
 
 type Node struct {
 	ID       int
+	ParentID int
 	Conn     net.Conn
 	Hostname string
 	Username string
@@ -60,6 +61,19 @@ func (r *Registry) Remove(id int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.nodes, id)
+}
+
+func (r *Registry) GetChildren(parentID int) []*Node {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	children := []*Node{}
+	for _, node := range r.nodes {
+		if node.ParentID == parentID {
+			children = append(children, node)
+		}
+	}
+	return children
 }
 
 func (n *Node) String() string {

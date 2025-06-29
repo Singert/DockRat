@@ -16,6 +16,9 @@ const (
 	MsgCommand   MessageType = "command"
 	MsgResponse  MessageType = "response"
 	MsgShell     MessageType = "shell"
+	// 拓扑相关消息	「
+	MsgListen  MessageType = "listen"
+	MsgConnect MessageType = "connect"
 )
 
 // Message 是基本通信结构

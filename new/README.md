@@ -173,17 +173,81 @@
 
 ---
 
-## 📌 项目分工建议（如多人合作）
-
-| 角色      | 负责模块                  |
-| ------- | --------------------- |
-| 通信协议设计者 | 定义消息协议、封包/解包、安全策略     |
-| 网络开发者   | TCP/WS通信、shell实现、文件传输 |
-| 控制台开发者  | REPL控制台、命令行 UI、美化交互   |
-| 安全策略开发者 | TLS、AES、节点验证、加密握手流程   |
-| 跨平台构建者  | Makefile、多平台编译、端口复用支持 |
-| 文档维护者   | 使用说明、示例脚本、交付文档        |
 
 ---
 
-是否需要我为你初始化一个项目结构骨架（含模块划分与主入口文件）？或者你希望从 **“阶段一”通信握手部分** 立即开始编码？
+📄 **推荐的 Git 提交信息格式如下：**
+
+```git
+feat(agent): refactor agent message handling and restore persistent shell via pty
+
+- Move agent logic to core/network/dispatcher.go
+- Support MsgCommand and MsgShell via shared PTY
+- Enable interactive shell session with context preservation (cd, export, etc.)
+```
+
+说明：
+
+* `feat(...)` 用于功能性变更
+* 第一行是简短摘要（<50字符），第二行空行，之后是详细说明
+
+---
+
+## ✅ 2. **Git commit 常见 message 格式（Conventional Commits）**
+
+这是社区通用规范 [Conventional Commits](https://www.conventionalcommits.org/) 的简写模板：
+
+```txt
+<type>(<scope>): <short summary>
+<BLANK LINE>
+<details (wrap at 72 chars)>
+```
+
+常见 `<type>` 类型：
+
+| 类型         | 含义                 |
+| ---------- | ------------------ |
+| `feat`     | 新功能                |
+| `fix`      | Bug 修复             |
+| `refactor` | 重构（非新功能/修复）        |
+| `chore`    | 构建工具、依赖等变更         |
+| `test`     | 添加或重构测试            |
+| `docs`     | 文档变更               |
+| `style`    | 格式调整，不影响语义（如空格、缩进） |
+| `perf`     | 性能优化               |
+
+示例：
+
+```txt
+feat(protocol): support MsgShell with interactive PTY
+
+Enable remote shell with creack/pty. Supports cd, export, etc.
+```
+
+---
+
+## ✅ 3. **五个后续功能的优先级推荐（建议实现顺序）**
+
+| 优先级 | 模块                       | 理由                      |
+| --- | ------------------------ | ----------------------- |
+| ✅ 1 | **upload/download 文件传输** | 基础功能，使用频率高，逻辑较清晰易实现     |
+| ✅ 2 | **拓扑连接：listen/connect**  | 实现多级代理所必需，为树状结构提供基础     |
+| ✅ 3 | **socks5 转发**            | 实现代理效果（例如访问内网），依赖已有连接结构 |
+| ✅ 4 | **TLS 加密与认证机制**          | 网络安全增强，建议拓扑结构稳定后实现      |
+| ✅ 5 | **日志模块化与 debug 面板**      | 用于稳定性调试与监控，适合中后期开发阶段    |
+
+---
+
+## ✅ 总结
+
+* ✍️ 本次提交推荐用 `feat(agent): ...` + 多行说明。
+* 📌 Conventional Commits 是结构化 commit 的主流规范。
+* 🔧 建议优先实现：
+
+  1. `upload/download`
+  2. `listen/connect`
+  3. `socks5`
+  4. `TLS`
+  5. `debug`
+
+是否现在开始实现文件上传（`upload`）功能？我可以帮你定义协议、admin/agent 指令、传输缓冲结构。

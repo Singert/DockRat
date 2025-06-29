@@ -9,12 +9,14 @@ import (
 
 	"github.com/Singert/DockRat/core/node"
 	"github.com/Singert/DockRat/core/protocol"
+	"github.com/Singert/DockRat/core/utils"
 )
 
 type HandshakePayload struct {
 	Hostname string `json:"hostname"`
 	Username string `json:"username"`
 	OS       string `json:"os"`
+	ParentID int    `json:"parent_id"` // 初始为 -1，表示没有父节点
 }
 
 func StartListener(addr string, registry *node.Registry) {
@@ -43,7 +45,7 @@ func handleConnection(conn net.Conn, registry *node.Registry) {
 		conn.Close()
 		return
 	}
-	length := bytesToUint32(lengthBuf)
+	length := utils.BytesToUint32(lengthBuf)
 	data := make([]byte, length)
 	if _, err := io.ReadFull(conn, data); err != nil {
 		log.Println("[!] Failed to read message body:", err)
@@ -72,6 +74,7 @@ func handleConnection(conn net.Conn, registry *node.Registry) {
 			Username: payload.Username,
 			OS:       payload.OS,
 			Addr:     conn.RemoteAddr().String(),
+			ParentID: payload.ParentID,
 		}
 		id := registry.Add(n)
 		log.Printf("[+] Registered agent ID %d - %s@%s (%s)", id, n.Username, n.Hostname, n.OS)
@@ -93,7 +96,7 @@ func handleAgentMessages(n *node.Node, registry *node.Registry) {
 			conn.Close()
 			return
 		}
-		length := bytesToUint32(lengthBuf)
+		length := utils.BytesToUint32(lengthBuf)
 		data := make([]byte, length)
 		if _, err := io.ReadFull(conn, data); err != nil {
 			log.Printf("[-] Node %d read failed: %v", n.ID, err)
@@ -118,5 +121,3 @@ func handleAgentMessages(n *node.Node, registry *node.Registry) {
 		}
 	}
 }
-
-

