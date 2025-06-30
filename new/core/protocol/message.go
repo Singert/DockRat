@@ -1,3 +1,4 @@
+// file: new/core/protocol/message.go
 package protocol
 
 import (
@@ -17,15 +18,22 @@ const (
 	MsgResponse  MessageType = "response"
 	MsgShell     MessageType = "shell"
 	// 拓扑相关消息	「
-	MsgListen  MessageType = "listen"
-	MsgConnect MessageType = "connect"
+	MsgListen        MessageType = "listen"
+	MsgConnect       MessageType = "connect"
+	MsgBindRelayConn MessageType = "bind_relay_conn" // 用于转发连接请求的回复
 )
 
 // Message 是基本通信结构
 // 结构体经过 JSON 编码后再加上长度前缀发送
 type Message struct {
-	Type    MessageType // such as handshake,shell,upload
-	Payload []byte      // the data to be sent, such as command or file content
+	Type       MessageType // such as handshake,shell,upload
+	Payload    []byte      // the data to be sent, such as command or file content
+	ToNodeID   int         `json:"to,omitempty"`   // 目标节点ID，,该字段仅由 admin → relay agent 时设置，用于转发给 child 节点
+	FromNodeID int         `json:"from,omitempty"` // 源节点ID，通常由 agent → relay agent 时设置
+}
+
+type BindRelayConnPayload struct {
+	ID int `json:"id"` // 要绑定的目标 Node ID
 }
 
 // EncodeMessage 将Message编码带长度前缀的字节流

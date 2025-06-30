@@ -245,6 +245,8 @@
 // 	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
 // }
 
+//file: new/cmd/admin/main.go
+
 package main
 
 import (
