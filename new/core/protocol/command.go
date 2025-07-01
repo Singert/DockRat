@@ -36,6 +36,11 @@ func StartConsole(registry *node.Registry) {
 			handleExec(arg, registry)
 		case "shell":
 			handleShell(arg, registry)
+		case "startrelay":
+			handleStartRelay(arg, registry)
+		case "topo":
+			handleTopo(registry)
+
 		default:
 			fmt.Println("[-] Unknown command")
 		}
@@ -54,22 +59,161 @@ func handleDetail(reg *node.Registry) {
 func handleExec(arg string, reg *node.Registry) {
 	parts := strings.SplitN(arg, " ", 2)
 	if len(parts) != 2 {
-		fmt.Println("[-] Usage: exec <node_id> <command>")
+		fmt.Println("[-] Usage: exec <id> <command>")
 		return
 	}
-	id := parts[0]
-	cmdStr := parts[1]
 	var nid int
-	fmt.Sscanf(id, "%d", &nid)
+	fmt.Sscanf(parts[0], "%d", &nid)
+	cmdPayload := map[string]string{"cmd": parts[1]}
+	data, _ := json.Marshal(cmdPayload)
+	msg := Message{Type: MsgCommand, Payload: data}
+
+	if err := sendMessageOrRelay(nid, msg, reg); err != nil {
+		fmt.Println("[-]", err)
+	} else {
+		fmt.Println("[+] Exec command sent.")
+	}
+}
+
+// func handleExec(arg string, reg *node.Registry) {
+// 	parts := strings.SplitN(arg, " ", 2)
+// 	if len(parts) != 2 {
+// 		fmt.Println("[-] Usage: exec <node_id> <command>")
+// 		return
+// 	}
+// 	id := parts[0]
+// 	cmdStr := parts[1]
+// 	var nid int
+// 	fmt.Sscanf(id, "%d", &nid)
+// 	n, ok := reg.Get(nid)
+// 	if !ok {
+// 		fmt.Println("[-] No such node")
+// 		return
+// 	}
+// 	cmdPayload := map[string]string{"cmd": cmdStr}
+// 	data, _ := json.Marshal(cmdPayload)
+// 	msg := Message{
+// 		Type:    MsgCommand,
+// 		Payload: data,
+// 	}
+// 	buf, err := EncodeMessage(msg)
+// 	if err != nil {
+// 		fmt.Println("[-] Encode failed:", err)
+// 		return
+// 	}
+// 	_, err = n.Conn.Write(buf)
+// 	if err != nil {
+// 		fmt.Println("[-] Send failed:", err)
+// 		return
+// 	}
+// }
+
+func handleShell(arg string, reg *node.Registry) {
+	var nid int
+	fmt.Sscanf(arg, "%d", &nid)
+
+	msg := Message{Type: MsgShell, Payload: []byte("start shell")}
+	if err := sendMessageOrRelay(nid, msg, reg); err != nil {
+		fmt.Println("[-]", err)
+		return
+	}
+
+	fmt.Println("[+] Shell started. Type commands (type 'exit' to quit):")
+	scanner := bufio.NewScanner(os.Stdin)
+	for {
+		fmt.Print("remote$ ")
+		if !scanner.Scan() {
+			break
+		}
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "exit" {
+			break
+		}
+		cmdMsg := Message{Type: MsgShell, Payload: []byte(line + "\n")}
+		if err := sendMessageOrRelay(nid, cmdMsg, reg); err != nil {
+			fmt.Println("[-] Shell write failed:", err)
+			break
+		}
+	}
+}
+
+//	func handleShell(arg string, reg *node.Registry) {
+//		var nid int
+//		fmt.Sscanf(arg, "%d", &nid)
+//		n, ok := reg.Get(nid)
+//		if !ok {
+//			fmt.Println("[-] No such node")
+//			return
+//		}
+//		msg := Message{
+//			Type:    MsgShell,
+//			Payload: []byte("start shell"),
+//		}
+//		buf, err := EncodeMessage(msg)
+//		if err != nil {
+//			fmt.Println("[-] Encode failed:", err)
+//			return
+//		}
+//		_, err = n.Conn.Write(buf)
+//		if err != nil {
+//			fmt.Println("[-] Send failed:", err)
+//			return
+//		}
+//		fmt.Println("[+] Shell started. Type commands (type 'exit' to quit):")
+//		inputScanner := bufio.NewScanner(os.Stdin)
+//		for {
+//			fmt.Print("remote$ ")
+//			if !inputScanner.Scan() {
+//				break
+//			}
+//			line := inputScanner.Text()
+//			if strings.TrimSpace(line) == "exit" {
+//				fmt.Println("[*] Exiting shell mode.")
+//				break
+//			}
+//			cmdMsg := Message{
+//				Type:    MsgShell,
+//				Payload: []byte(line + "\n"),
+//			}
+//			buf, err := EncodeMessage(cmdMsg)
+//			if err != nil {
+//				fmt.Println("[-] Shell encode error:", err)
+//				break
+//			}
+//			_, err = n.Conn.Write(buf)
+//			if err != nil {
+//				fmt.Println("[-] Shell write error:", err)
+//				break
+//			}
+//		}
+//	}
+func handleStartRelay(arg string, reg *node.Registry) {
+	parts := strings.Fields(arg)
+	if len(parts) != 2 {
+		fmt.Println("Usage: startrelay <node_id> <port>")
+		return
+	}
+	var nid int
+	port := parts[1]
+	fmt.Sscanf(parts[0], "%d", &nid)
+
 	n, ok := reg.Get(nid)
 	if !ok {
 		fmt.Println("[-] No such node")
 		return
 	}
-	cmdPayload := map[string]string{"cmd": cmdStr}
-	data, _ := json.Marshal(cmdPayload)
+
+	// 分配编号段（每个 relay 分配 1000 个 ID）
+	baseID := nid * 1000
+	payload := StartRelayPayload{
+		SelfID:     nid,
+		ListenAddr: ":" + port,
+		IDStart:    baseID + 1,
+		Count:      999,
+	}
+	data, _ := json.Marshal(payload)
 	msg := Message{
-		Type:    MsgCommand,
+		Type:    MsgStartRelay,
 		Payload: data,
 	}
 	buf, err := EncodeMessage(msg)
@@ -82,55 +226,48 @@ func handleExec(arg string, reg *node.Registry) {
 		fmt.Println("[-] Send failed:", err)
 		return
 	}
+	fmt.Printf("[+] Sent startrelay to node %d, range = [%d ~ %d]\n", nid, payload.IDStart, payload.IDStart+payload.Count-1)
 }
+func handleTopo(reg *node.Registry) {
+	reg.PrintTopology()
+}
+func sendMessageOrRelay(nid int, msg Message, reg *node.Registry) error {
+	data, err := EncodeMessage(msg)
+	if err != nil {
+		return fmt.Errorf("encode failed: %w", err)
+	}
 
-func handleShell(arg string, reg *node.Registry) {
-	var nid int
-	fmt.Sscanf(arg, "%d", &nid)
 	n, ok := reg.Get(nid)
 	if !ok {
-		fmt.Println("[-] No such node")
-		return
+		return fmt.Errorf("no such node")
 	}
-	msg := Message{
-		Type:    MsgShell,
-		Payload: []byte("start shell"),
+
+	// 如果是直连 agent，直接发送
+	if n.Conn != nil {
+		_, err := n.Conn.Write(data)
+		return err
 	}
-	buf, err := EncodeMessage(msg)
+
+	// 否则构造 RelayPacket
+	parentID := reg.NodeGraph.GetParent(nid)
+	parentNode, ok := reg.Get(parentID)
+	if !ok || parentNode.Conn == nil {
+		return fmt.Errorf("no relay available for node %d", nid)
+	}
+
+	packet := RelayPacket{
+		DestID: nid,
+		Data:   data,
+	}
+	pktBytes, _ := json.Marshal(packet)
+	wrapped := Message{
+		Type:    MsgRelayPacket,
+		Payload: pktBytes,
+	}
+	buf, err := EncodeMessage(wrapped)
 	if err != nil {
-		fmt.Println("[-] Encode failed:", err)
-		return
+		return fmt.Errorf("relay encode error: %w", err)
 	}
-	_, err = n.Conn.Write(buf)
-	if err != nil {
-		fmt.Println("[-] Send failed:", err)
-		return
-	}
-	fmt.Println("[+] Shell started. Type commands (type 'exit' to quit):")
-	inputScanner := bufio.NewScanner(os.Stdin)
-	for {
-		fmt.Print("remote$ ")
-		if !inputScanner.Scan() {
-			break
-		}
-		line := inputScanner.Text()
-		if strings.TrimSpace(line) == "exit" {
-			fmt.Println("[*] Exiting shell mode.")
-			break
-		}
-		cmdMsg := Message{
-			Type:    MsgShell,
-			Payload: []byte(line + "\n"),
-		}
-		buf, err := EncodeMessage(cmdMsg)
-		if err != nil {
-			fmt.Println("[-] Shell encode error:", err)
-			break
-		}
-		_, err = n.Conn.Write(buf)
-		if err != nil {
-			fmt.Println("[-] Shell write error:", err)
-			break
-		}
-	}
+	_, err = parentNode.Conn.Write(buf)
+	return err
 }

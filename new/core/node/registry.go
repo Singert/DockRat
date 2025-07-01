@@ -1,3 +1,4 @@
+// File: core/node/registry.go
 package node
 
 import (
@@ -16,14 +17,16 @@ type Node struct {
 }
 
 type Registry struct {
-	nodes  map[int]*Node
-	mu     sync.Mutex
-	nextID int
+	nodes     map[int]*Node
+	mu        sync.Mutex
+	nextID    int
+	NodeGraph *NodeGraph
 }
 
 func NewRegistry() *Registry {
 	return &Registry{
-		nodes: make(map[int]*Node),
+		nodes:     make(map[int]*Node),
+		NodeGraph: NewNodeGraph(), // 初始化拓扑图
 	}
 }
 
@@ -67,10 +70,13 @@ func (n *Node) String() string {
 		n.ID, n.Addr, n.Hostname, n.Username, n.OS)
 }
 
-/*
-现在你的 NodeRegistry 已具备完整的增、删、查、列能力，下一步你可以轻松支持：
+func (r *Registry) AddWithID(n *Node) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-    控制指定节点：通过 registry.Get(id) 发送命令
-
-    实现自动断线剔除：通过 Remove(id) 清除离线节点
-*/
+	id := n.ID
+	r.nodes[id] = n
+	if id >= r.nextID {
+		r.nextID = id + 1
+	}
+}

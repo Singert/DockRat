@@ -8,12 +8,15 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/Singert/DockRat/core/common"
+	"github.com/Singert/DockRat/core/node"
 	"github.com/Singert/DockRat/core/protocol"
 	"github.com/creack/pty"
 )
 
 var shellStarted = false
 var shellStdin io.WriteCloser
+var relayCtx *RelayContext // 全局变量，供 MsgRelayPacket 使用
 
 func StartAgent(conn net.Conn) {
 	for {
@@ -40,6 +43,34 @@ func StartAgent(conn net.Conn) {
 			handleCommand(msg, conn)
 		case protocol.MsgShell:
 			handleShellPTY(msg, conn)
+		case protocol.MsgStartRelay:
+			handleStartRelay(msg, conn)
+		case protocol.MsgRelayAck:
+			var ack protocol.RelayAckPayload
+			if err := json.Unmarshal(msg.Payload, &ack); err != nil {
+				log.Println("[-] Decode relay_ack failed:", err)
+				return
+			}
+			log.Printf("[+] Relay register success: %s", ack.Message)
+
+		case protocol.MsgRelayError:
+			var errMsg protocol.RelayAckPayload
+			if err := json.Unmarshal(msg.Payload, &errMsg); err != nil {
+				log.Println("[-] Decode relay_error failed:", err)
+				return
+			}
+			log.Printf("[!] Relay register failed: %s", errMsg.Message)
+		case protocol.MsgRelayPacket:
+			var pkt protocol.RelayPacket
+			if err := json.Unmarshal(msg.Payload, &pkt); err != nil {
+				log.Println("[-] Decode relay_packet failed:", err)
+				break
+			}
+			if relayCtx != nil {
+				HandleRelayPacket(relayCtx, pkt)
+			} else {
+				log.Println("[-] Relay context not initialized")
+			}
 		default:
 			log.Println("[-] Unknown message type:", msg.Type)
 		}
@@ -117,3 +148,54 @@ func handleShellPTY(msg protocol.Message, conn net.Conn) {
 		log.Println("[-] Write to shell error:", err)
 	}
 }
+func handleStartRelay(msg protocol.Message, conn net.Conn) {
+	var payload protocol.StartRelayPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Println("[-] StartRelay payload decode error:", err)
+		return
+	}
+
+	log.Printf("[*] Received startrelay command: listen on %s, ID range [%d ~ %d]",
+		payload.ListenAddr, payload.IDStart, payload.IDStart+payload.Count-1)
+
+	// 创建本地结构
+	reg := node.NewRegistry()
+	topo := node.NewNodeGraph()
+	alloc := common.NewIDAllocator(payload.IDStart, payload.Count)
+
+	ctx := &RelayContext{
+		SelfID:      payload.SelfID, // 后续可传入或由自身记录
+		Registry:    reg,
+		Topology:    topo,
+		IDAllocator: alloc,
+		Upstream:    conn, // 保持与 admin 的通道
+	}
+	relayCtx = ctx
+	go StartRelayListener(payload.ListenAddr, ctx)
+
+	// 上报成功
+	ack := protocol.RelayReadyPayload{
+		SelfID:     -1, // 此处为当前 agent 自己的 ID，建议 future enhancement 填入
+		ListenAddr: payload.ListenAddr,
+	}
+	data, _ := json.Marshal(ack)
+	resp := protocol.Message{
+		Type:    protocol.MsgRelayReady,
+		Payload: data,
+	}
+	buf, _ := protocol.EncodeMessage(resp)
+	conn.Write(buf)
+}
+
+/*
+✅ 补充建议（结构更优雅方案）
+
+后续可以考虑：
+
+    拆分 relay 与普通 agent 启动逻辑：
+
+        StartBasicAgent(conn)
+
+        StartRelayAgent(conn, ctx)
+
+    将 relay 端启动逻辑独立于 StartAgent()，更便于测试与维护。*/
