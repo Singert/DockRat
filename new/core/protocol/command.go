@@ -75,39 +75,6 @@ func handleExec(arg string, reg *node.Registry) {
 	}
 }
 
-// func handleExec(arg string, reg *node.Registry) {
-// 	parts := strings.SplitN(arg, " ", 2)
-// 	if len(parts) != 2 {
-// 		fmt.Println("[-] Usage: exec <node_id> <command>")
-// 		return
-// 	}
-// 	id := parts[0]
-// 	cmdStr := parts[1]
-// 	var nid int
-// 	fmt.Sscanf(id, "%d", &nid)
-// 	n, ok := reg.Get(nid)
-// 	if !ok {
-// 		fmt.Println("[-] No such node")
-// 		return
-// 	}
-// 	cmdPayload := map[string]string{"cmd": cmdStr}
-// 	data, _ := json.Marshal(cmdPayload)
-// 	msg := Message{
-// 		Type:    MsgCommand,
-// 		Payload: data,
-// 	}
-// 	buf, err := EncodeMessage(msg)
-// 	if err != nil {
-// 		fmt.Println("[-] Encode failed:", err)
-// 		return
-// 	}
-// 	_, err = n.Conn.Write(buf)
-// 	if err != nil {
-// 		fmt.Println("[-] Send failed:", err)
-// 		return
-// 	}
-// }
-
 func handleShell(arg string, reg *node.Registry) {
 	var nid int
 	fmt.Sscanf(arg, "%d", &nid)
@@ -137,56 +104,6 @@ func handleShell(arg string, reg *node.Registry) {
 	}
 }
 
-//	func handleShell(arg string, reg *node.Registry) {
-//		var nid int
-//		fmt.Sscanf(arg, "%d", &nid)
-//		n, ok := reg.Get(nid)
-//		if !ok {
-//			fmt.Println("[-] No such node")
-//			return
-//		}
-//		msg := Message{
-//			Type:    MsgShell,
-//			Payload: []byte("start shell"),
-//		}
-//		buf, err := EncodeMessage(msg)
-//		if err != nil {
-//			fmt.Println("[-] Encode failed:", err)
-//			return
-//		}
-//		_, err = n.Conn.Write(buf)
-//		if err != nil {
-//			fmt.Println("[-] Send failed:", err)
-//			return
-//		}
-//		fmt.Println("[+] Shell started. Type commands (type 'exit' to quit):")
-//		inputScanner := bufio.NewScanner(os.Stdin)
-//		for {
-//			fmt.Print("remote$ ")
-//			if !inputScanner.Scan() {
-//				break
-//			}
-//			line := inputScanner.Text()
-//			if strings.TrimSpace(line) == "exit" {
-//				fmt.Println("[*] Exiting shell mode.")
-//				break
-//			}
-//			cmdMsg := Message{
-//				Type:    MsgShell,
-//				Payload: []byte(line + "\n"),
-//			}
-//			buf, err := EncodeMessage(cmdMsg)
-//			if err != nil {
-//				fmt.Println("[-] Shell encode error:", err)
-//				break
-//			}
-//			_, err = n.Conn.Write(buf)
-//			if err != nil {
-//				fmt.Println("[-] Shell write error:", err)
-//				break
-//			}
-//		}
-//	}
 func handleStartRelay(arg string, reg *node.Registry) {
 	parts := strings.Fields(arg)
 	if len(parts) != 2 {

