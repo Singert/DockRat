@@ -172,7 +172,7 @@ func handleStartRelay(msg protocol.Message, conn net.Conn) {
 	}
 	relayCtx = ctx
 	go StartRelayListener(payload.ListenAddr, ctx)
-
+	go StartAgent(conn)
 	// 上报成功
 	ack := protocol.RelayReadyPayload{
 		SelfID:     -1, // 此处为当前 agent 自己的 ID，建议 future enhancement 填入

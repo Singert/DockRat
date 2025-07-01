@@ -2,6 +2,7 @@ package network
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -111,8 +112,31 @@ func HandleRelayConnection(conn net.Conn, ctx *RelayContext) {
 		Type:    protocol.MsgRelayRegister,
 		Payload: reportBytes,
 	}
-	buf, _ := protocol.EncodeMessage(msgOut)
-	ctx.Upstream.Write(buf)
+
+	// 判断是否向 admin 上报（ID -1 表示 admin）
+	switch ctx.SelfID {
+	case -1:
+		// 不应该发生：RelayContext 不应为 -1
+		log.Println("[-] Invalid SelfID == -1 in relay")
+	case 0:
+		// relay0 → admin（直接连接）
+		buf, _ := protocol.EncodeMessage(msgOut)
+		ctx.Upstream.Write(buf)
+	default:
+		// relayN → relayX → ... → admin（封装为 RelayPacket 向上）
+		inner, _ := protocol.EncodeMessage(msgOut)
+		pkt := protocol.RelayPacket{
+			DestID: -1, // admin ID 统一约定为 -1
+			Data:   inner,
+		}
+		pktBytes, _ := json.Marshal(pkt)
+		wrapped := protocol.Message{
+			Type:    protocol.MsgRelayPacket,
+			Payload: pktBytes,
+		}
+		buf, _ := protocol.EncodeMessage(wrapped)
+		ctx.Upstream.Write(buf)
+	}
 
 	// 启动消息读取
 	go HandleRelayAgentMessages(n, ctx)
@@ -160,7 +184,24 @@ func HandleRelayAgentMessages(n *node.Node, ctx *RelayContext) {
 }
 
 // 该函数用于 relay 收到一个 RelayPacket 后，向下路由目标 agent。
+// 特殊情况：目标是 admin（约定 ID = -1）
 func HandleRelayPacket(ctx *RelayContext, pkt protocol.RelayPacket) {
+
+	// 特殊情况：目标是 admin（约定 ID = -1）
+	if pkt.DestID == -1 {
+		// 不处理内容，只做透传向上
+		pktBytes, _ := json.Marshal(pkt)
+		wrapped := protocol.Message{
+			Type:    protocol.MsgRelayPacket,
+			Payload: pktBytes,
+		}
+		buf, _ := protocol.EncodeMessage(wrapped)
+		ctx.Upstream.Write(buf)
+		fmt.Printf("[Relay %d] Relay packet to admin: %s\n", ctx.SelfID, pkt.Data)
+		return
+	}
+
+	// 正常向下路由目标 agent
 	target, ok := ctx.Registry.Get(pkt.DestID)
 	if !ok {
 		log.Printf("[-] Relay: unknown target ID %d", pkt.DestID)

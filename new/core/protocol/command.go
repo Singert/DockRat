@@ -114,12 +114,6 @@ func handleStartRelay(arg string, reg *node.Registry) {
 	port := parts[1]
 	fmt.Sscanf(parts[0], "%d", &nid)
 
-	n, ok := reg.Get(nid)
-	if !ok {
-		fmt.Println("[-] No such node")
-		return
-	}
-
 	// 分配编号段（每个 relay 分配 1000 个 ID）
 	baseID := nid * 1000
 	payload := StartRelayPayload{
@@ -133,14 +127,10 @@ func handleStartRelay(arg string, reg *node.Registry) {
 		Type:    MsgStartRelay,
 		Payload: data,
 	}
-	buf, err := EncodeMessage(msg)
-	if err != nil {
-		fmt.Println("[-] Encode failed:", err)
-		return
-	}
-	_, err = n.Conn.Write(buf)
-	if err != nil {
-		fmt.Println("[-] Send failed:", err)
+
+	// ❗使用通用发送函数，自动 relay
+	if err := sendMessageOrRelay(nid, msg, reg); err != nil {
+		fmt.Println("[-] Failed to send startrelay:", err)
 		return
 	}
 	fmt.Printf("[+] Sent startrelay to node %d, range = [%d ~ %d]\n", nid, payload.IDStart, payload.IDStart+payload.Count-1)
