@@ -124,7 +124,7 @@ func HandleRelayConnection(conn net.Conn, ctx *RelayContext) {
 		ctx.Upstream.Write(buf)
 	default:
 		// relayN → relayX → ... → admin（封装为 RelayPacket 向上）
-		inner, _ := protocol.EncodeMessage(msgOut)
+		inner, _ := json.Marshal(msgOut)
 		pkt := protocol.RelayPacket{
 			DestID: -1, // admin ID 统一约定为 -1
 			Data:   inner,
@@ -138,8 +138,11 @@ func HandleRelayConnection(conn net.Conn, ctx *RelayContext) {
 		ctx.Upstream.Write(buf)
 	}
 
-	// 启动消息读取
-	go HandleRelayAgentMessages(n, ctx)
+	// FIXME:// 启动消息读取
+	// go HandleRelayAgentMessages(n, ctx)
+
+	//监听来自该连接的 relay_packet 上报（如：relayN 注册信息）
+	go StartRelayAgent(conn, ctx)
 }
 
 // 该函数与 admin 的 handleAgentMessages() 类似，

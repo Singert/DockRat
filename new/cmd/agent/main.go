@@ -56,7 +56,7 @@ func main() {
 
 	log.Println("[+] Handshake message sent")
 
-	network.  StartAgent(conn)
+	network.StartBasicAgent(conn)
 }
 
 /*是否继续实现：
