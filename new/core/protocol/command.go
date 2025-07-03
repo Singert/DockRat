@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 
@@ -75,15 +76,37 @@ func handleExec(arg string, reg *node.Registry) {
 	}
 }
 
+// func handleShell(arg string, reg *node.Registry) {
+// 	var nid int
+// 	fmt.Sscanf(arg, "%d", &nid)
+
+// 	msg := Message{Type: MsgShell, Payload: []byte("\n")}
+// 	if err := sendMessageOrRelay(nid, msg, reg); err != nil {
+// 		fmt.Println("[-]", err)
+// 		return
+// 	}
+
+//		fmt.Println("[+] Shell started. Type commands (type 'exit' to quit):")
+//		scanner := bufio.NewScanner(os.Stdin)
+//		for {
+//			fmt.Print("remote$ ")
+//			if !scanner.Scan() {
+//				break
+//			}
+//			line := scanner.Text()
+//			if strings.TrimSpace(line) == "exit" {
+//				break
+//			}
+//			cmdMsg := Message{Type: MsgShell, Payload: []byte(line + "\n")}
+//			if err := sendMessageOrRelay(nid, cmdMsg, reg); err != nil {
+//				fmt.Println("[-] Shell write failed:", err)
+//				break
+//			}
+//		}
+//	}
 func handleShell(arg string, reg *node.Registry) {
 	var nid int
 	fmt.Sscanf(arg, "%d", &nid)
-
-	msg := Message{Type: MsgShell, Payload: []byte("start shell")}
-	if err := sendMessageOrRelay(nid, msg, reg); err != nil {
-		fmt.Println("[-]", err)
-		return
-	}
 
 	fmt.Println("[+] Shell started. Type commands (type 'exit' to quit):")
 	scanner := bufio.NewScanner(os.Stdin)
@@ -93,7 +116,11 @@ func handleShell(arg string, reg *node.Registry) {
 			break
 		}
 		line := scanner.Text()
-		if strings.TrimSpace(line) == "exit" {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue // ✅ 忽略空输入
+		}
+		if trimmed == "exit" {
 			break
 		}
 		cmdMsg := Message{Type: MsgShell, Payload: []byte(line + "\n")}
@@ -149,24 +176,38 @@ func sendMessageOrRelay(nid int, msg Message, reg *node.Registry) error {
 		return fmt.Errorf("no such node")
 	}
 
-	// 如果是直连 agent，直接发送
+	// ✅ 尝试直接发送
 	if n.Conn != nil {
 		_, err := n.Conn.Write(data)
 		return err
 	}
+	// ✅ 否则向上 relay
+	currID := nid
+	var parentConn net.Conn
+	for {
+		pid := reg.NodeGraph.GetParent(currID)
+		if pid == -1 {
+			return fmt.Errorf("no relay path from node %d: reached root", nid)
+		}
 
-	// 否则构造 RelayPacket
-	parentID := reg.NodeGraph.GetParent(nid)
-	parentNode, ok := reg.Get(parentID)
-	if !ok || parentNode.Conn == nil {
-		return fmt.Errorf("no relay available for node %d", nid)
+		parentNode, ok := reg.Get(pid)
+		if ok && parentNode.Conn != nil {
+			parentConn = parentNode.Conn
+			break
+		}
+
+		currID = pid
 	}
 
 	packet := RelayPacket{
 		DestID: nid,
 		Data:   data,
 	}
-	pktBytes, _ := json.Marshal(packet)
+	pktBytes, err := json.Marshal(packet)
+	if err != nil {
+		return fmt.Errorf("relay packet marshal failed: %w", err)
+	}
+
 	wrapped := Message{
 		Type:    MsgRelayPacket,
 		Payload: pktBytes,
@@ -175,6 +216,42 @@ func sendMessageOrRelay(nid int, msg Message, reg *node.Registry) error {
 	if err != nil {
 		return fmt.Errorf("relay encode error: %w", err)
 	}
-	_, err = parentNode.Conn.Write(buf)
+
+	_, err = parentConn.Write(buf)
 	return err
+
+	// // ✅ 否则向上 relay
+	// parentID := reg.NodeGraph.GetParent(nid)
+	// parentNode, ok := reg.Get(parentID)
+	// if !ok {
+	// 	return fmt.Errorf("no relay available for node %d: parent node %d not found", nid, parentID)
+	// }
+	// if parentNode.Conn == nil {
+	// 	return fmt.Errorf("no relay available for node %d: parent node %d has nil conn", nid, parentID)
+	// }
+
+	// packet := RelayPacket{
+	// 	DestID: nid,
+	// 	Data:   data,
+	// }
+	// pktBytes, err := json.Marshal(packet)
+	// if err != nil {
+	// 	return fmt.Errorf("relay packet marshal failed: %w", err)
+	// }
+
+	// wrapped := Message{
+	// 	Type:    MsgRelayPacket,
+	// 	Payload: pktBytes,
+	// }
+	// buf, err := EncodeMessage(wrapped)
+	// if err != nil {
+	// 	return fmt.Errorf("relay encode error: %w", err)
+	// }
+
+	// // ✅ 向父节点转发
+	// _, err = parentNode.Conn.Write(buf)
+	// if err != nil {
+	// 	return fmt.Errorf("relay write error: %w", err)
+	// }
+	// return nil
 }

