@@ -1,0 +1,9 @@
+# 编写规则实现对子文件夹下 download/ 和 upload/ 的忽略
+# 规则：
+# 忽略 download/ 和 upload/ 文件夹
+download/
+upload/
+
+# 规则：
+# 忽略所有子文件夹的code.txt
+**/code.txt
