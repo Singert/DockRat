@@ -38,6 +38,7 @@ func SetBackwardTargetFromPrefix(connID string) bool {
 		if len(connID) >= len(prefix) && connID[:len(prefix)] == prefix {
 			backwardTarget[connID] = val.Target
 			connAgentMap[connID] = val.AgentID
+			//TODO: delete or not ?
 			delete(backwardTargetPrefix, prefix)
 			return true
 		}
@@ -146,4 +147,13 @@ func sendMessageToAgent(connID string, msg Message) {
 	if err != nil {
 		log.Printf("[-] sendMessageToAgent failed: %v", err)
 	}
+}
+func ListBackwardConns() map[string]net.Conn {
+	mu.Lock()
+	defer mu.Unlock()
+	result := make(map[string]net.Conn)
+	for k, v := range backwardConnMap {
+		result[k] = v
+	}
+	return result
 }

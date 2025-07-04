@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strings"
 
@@ -50,7 +51,14 @@ func StartConsole(registry *node.Registry) {
 			handleForward(arg, registry)
 		case "backward":
 			handleBackward(arg, registry)
-
+		case "forward_stop":
+			handleStopForward(arg)
+		case "backward_stop":
+			handleStopBackward(arg)
+		case "list_forward":
+			handleListForward(arg)
+		case "list_backward":
+			handleListBackward(arg)
 		default:
 			fmt.Println("[-] Unknown command")
 		}
@@ -333,4 +341,54 @@ func handleBackward(arg string, reg *node.Registry) {
 		return
 	}
 	fmt.Printf("[+] Instructed agent[%d] to listen on :%d (→ admin connect %s)\n", nid, port, target)
+}
+func handleStopForward(arg string) {
+	connID := strings.TrimSpace(arg)
+	conn, ok := GetForwardConn(connID)
+	if !ok {
+		fmt.Println("[-] No such forward connection:", connID)
+		return
+	}
+	conn.Close()
+	RemoveForwardConn(connID)
+	fmt.Println("[+] ForwardConn", connID, "stopped")
+	PrintPrompt()
+}
+
+func handleStopBackward(arg string) {
+	connID := strings.TrimSpace(arg)
+	conn, ok := GetBackwardConn(connID)
+	if !ok {
+		log.Print("[-] No such backward connection:", connID)
+		PrintPrompt()
+		return
+	}
+	conn.Close()
+	RemoveBackwardConn(connID)
+	fmt.Println("[+] BackwardConn", connID, "stopped")
+}
+func handleListForward(_ string) {
+	conns := ListForwardConns()
+	if len(conns) == 0 {
+		log.Print("No active forward connections.")
+		return
+	}
+	fmt.Println("Active forward connections:")
+	for id, c := range conns {
+		fmt.Printf("  %s → %s\n", id, c.RemoteAddr())
+	}
+	PrintPrompt()
+}
+
+func handleListBackward(_ string) {
+	conns := ListBackwardConns()
+	if len(conns) == 0 {
+		fmt.Println("No active backward connections.")
+		return
+	}
+	fmt.Println("Active backward connections:")
+	for id, c := range conns {
+		fmt.Printf("  %s → %s\n", id, c.RemoteAddr())
+	}
+	PrintPrompt()
 }

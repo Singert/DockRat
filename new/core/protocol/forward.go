@@ -95,3 +95,12 @@ func GetForwardConn(connID string) (net.Conn, bool) {
 func RemoveForwardConn(connID string) {
 	delete(forwardConnMap, connID)
 }
+func ListForwardConns() map[string]net.Conn {
+	mu.Lock()
+	defer mu.Unlock()
+	result := make(map[string]net.Conn)
+	for k, v := range forwardConnMap {
+		result[k] = v
+	}
+	return result
+}

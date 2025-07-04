@@ -1,343 +1,294 @@
-好的，以下是一个**完整的 Go 语言复刻版 Stowaway 多级代理工具的开发路线图**，我们将分阶段、按功能模块逐步构建，并优先实现核心通信和管理能力，最终达成稳定、可扩展、可跨平台的渗透测试辅助工具。
+
+网安2201
+常兆鑫
+2226114409
 
 ---
 
-# 🛠️ Stowaway 复刻项目开发路线图
+# 📡 DockRat – 多级中继式远程控制平台
 
-## ✅ 阶段一：核心架构与通信模型
+DockRat 是一个支持多级 relay 拓扑结构的远程控制平台，采用 Go 语言开发，具备轻量、模块化、高可控等特性，适用于安全研究、远程维护、远程执行等场景。
 
-**目标：实现 admin 与 agent 的基础连接 + 控制命令通道**
-
-### ✔️ 子任务：
-
-1. **项目结构设计**
-
-   * `cmd/admin/`、`cmd/agent/`：入口程序
-   * `core/network/`：连接管理（握手、封包、解包）
-   * `core/protocol/`：定义消息类型和结构体（如 CONNECT、SHELL、UPLOAD）
-   * `core/common/`：日志、配置、错误处理等工具包
-
-2. **节点结构设计**
-
-   * 每个节点维护：
-
-     * 节点 ID
-     * 父节点连接
-     * 子节点列表
-     * 状态（连接中、断开、重连中）
-     * 备注（Memo）
-
-3. **admin 与 agent 基本握手机制**
-
-   * 主动连接/被动监听
-   * 握手认证（密钥校验）
-   * 节点注册流程
-   * 支持 JSON 协议 or TLV 封包协议（推荐自定义结构体 + length-prefixed）
-
-4. **基本命令协议封装**
-
-   * 自定义控制包格式：`type | length | payload`
-   * 支持简单命令下发与响应（ping、pong、echo、exit）
+> ✅ 支持直连与 relay 模式
+> ✅ 支持端口转发、shell、文件传输、反向连接
+> ✅ 控制命令清晰易用
+> ✅ 拓扑结构可视化
 
 ---
 
-## ✅ 阶段二：多级节点管理与拓扑构建
+## 🔧 当前支持功能（截至 2025-07）
 
-**目标：构建 admin 控制台 + 支持多级代理链路**
+### ✅ 节点管理
 
-### ✔️ 子任务：
+* 支持多节点注册（直连 / relay 模式）
+* `startrelay <id> <port>`：启动 relay 功能，子节点从此连接
+* `topo`：可视化打印当前节点拓扑结构
 
-1. **节点拓扑维护（树状结构）**
+### ✅ Shell 功能
 
-   * 每个节点可以连接/监听下游节点
-   * admin 支持 topo 展示树形结构（基于 ID 或 ASCII 树）
+* `shell <id>`：启动交互式 shell
+* 保持持久上下文（支持 cd / export 等）
+* 支持多层 relay shell 透传
 
-2. **admin 控制台实现**
+### ✅ 文件上传下载
 
-   * REPL 输入循环（支持命令补全）
-   * 支持 `use <id>`、`detail`、`topo`、`connect`、`listen` 等基础指令
+* `upload <id> <local> <remote>`：上传文件
+* `download <id> <remote> <local>`：下载文件（支持大文件分片）
 
-3. **节点命令分发与路由**
+### ✅ 端口转发
 
-   * admin -> agent0 -> agent1 -> agent2 -> ...
-   * 控制命令逐层传递（包中带目标节点路径）
+* **正向转发（forward）**
+  `forward <id> <local_port> <target_host:port>`
+  建立从 admin 本地端口 → agent → 内网目标的通道
 
----
+* **反向转发（backward）**
+  `backward <id> <agent_listen_port> <admin_target>`
+  agent 监听端口，admin 主动连接后转发至目标服务
 
-## ✅ 阶段三：交互式 shell 与文件传输
+* ✅ 已支持：
 
-**目标：支持远程 shell、上传下载功能**
+  * relay 子节点 forward
+  * 直连节点 forward + backward
 
-### ✔️ 子任务：
+* ❌ 未支持：relay 子节点 backward（已知问题）
 
-1. **远程 shell（exec 模式）**
+### ✅ 连接控制指令
 
-   * agent 启动一个 `bash`/`sh` 子进程，绑定 stdin/stdout
-   * 利用数据通道实现实时输入输出传输（基于多路复用）
-   * 可选支持 creack/pty（完整伪终端支持）
-
-2. **文件上传与下载**
-
-   * 支持单文件传输命令：`upload local remote` / `download remote local`
-   * 流控机制（分片、确认、完整性校验）
-   * 支持显示传输进度
-
----
-
-## ✅ 阶段四：端口转发、socks5、反向连接
-
-**目标：实现代理功能与正/反向端口映射**
-
-### ✔️ 子任务：
-
-1. **socks5 代理服务**
-
-   * 在 admin 上启动 socks5 server，转发流量至某个 agent 通道
-   * 基于 agent 构建链路，转发请求
-
-2. **端口转发与反向映射**
-
-   * forward：admin -> agent -> target\:port
-   * backward：agent 监听端口，将流量反向转发至 admin 本地端口
-
-3. **代理链路中的流量中转设计**
-
-   * TCP 数据转发中继机制
-   * 支持链路连接检查、连接断开自动清理
+* `stopforward <connID>`：关闭指定 forward 通道
+* `stopbackward <connID>`：关闭指定 backward 通道
+* `listforward`：查看当前 forward 通道状态
+* `listbackward`：查看当前 backward 通道状态
 
 ---
 
-## ✅ 阶段五：高级功能与平台适配
-
-**目标：提升稳定性与跨平台兼容性**
-
-### ✔️ 子任务：
-
-1. **TLS / AES-256-GCM 加密**
-
-   * TLS 双向验证（admin/agent 证书）
-   * AES 对称密钥加密（支持密钥协商或预共享）
-
-2. **重连机制**
-
-   * agent 主动模式下 `--reconnect` 间隔重连
-   * 被动模式 agent 自动恢复监听
-   * admin 可尝试恢复节点链路
-
-3. **端口复用机制**
-
-   * 基于 SO\_REUSEPORT / SO\_REUSEADDR（Win/mac/Linux）
-   * 基于 IPTABLES（Linux）+ 脚本工具自动配置清理
-
-4. **平台适配与交叉编译**
-
-   * Makefile 支持多平台编译：Windows、Linux、MIPS、ARM
-
----
-
-## ✅ 阶段六：交互优化与命令集完整化
-
-**目标：还原原版控制台全部功能 + 美化交互**
-
-### ✔️ 子任务：
-
-1. 控制台支持：
-
-   * tab 补全（使用 `github.com/c-bata/go-prompt`）
-   * 命令历史、上下切换
-   * 交互输出美化（颜色、高亮、ASCII 树）
-
-2. 命令集完整复刻：
-
-   * `upload/download`
-   * `socks/stopsocks`
-   * `forward/backward/stopforward/stopbackward`
-   * `memo/addmemo/delmemo`
-   * `shutdown/back/exit`
-   * `ssh/sshtunnel`
-   * `listen` 三种模式支持（普通、SOReuse、IPTABLES）
-
----
-
-## 🎯 阶段七：稳定性、安全性与发布
-
-**目标：项目收尾与测试发布**
-
-### ✔️ 子任务：
-
-1. 完善日志系统（agent 可输出标准日志 / admin 实时监控）
-2. 编写配置文件支持（YAML/JSON），用于批量部署
-3. 编写项目 README、使用手册、快速部署文档
-4. 编写测试脚本与网络环境模拟器
-5. Release 自动构建产物（GitHub Actions 或 Makefile）
-
----
-
-## 📌 项目分工建议（如多人合作）
-
-| 角色      | 负责模块                  |
-| ------- | --------------------- |
-| 通信协议设计者 | 定义消息协议、封包/解包、安全策略     |
-| 网络开发者   | TCP/WS通信、shell实现、文件传输 |
-| 控制台开发者  | REPL控制台、命令行 UI、美化交互   |
-| 安全策略开发者 | TLS、AES、节点验证、加密握手流程   |
-| 跨平台构建者  | Makefile、多平台编译、端口复用支持 |
-| 文档维护者   | 使用说明、示例脚本、交付文档        |
-
----
-
-# Relay机制设计
+## 🖥️ 实际运行截图
 
 
----
+### 节点注册与拓扑展示
 
-## ✅ 接受并整合你的两个提议
-
-### ✅ 1）**仍采用你提出的 ID 分配方法**
-
-* 每个 relay 节点向 admin 注册后，admin 为其 **分配一段编号空间**（例如 1000 \~ 1999）；
-* relay 将这段编号用于为其 **所有后代节点**分配 ID（避免冲突）；
-* 每个 relay **自行管理该编号段的分配状态**。
-
----
-
-### ✅ 2）**每个 relay 拥有独立的逻辑视图**
-
-* 每个 relay 都有自己的：
-
-  * `Registry`：子节点连接与 ID 的本地管理；
-  * `NodeGraph`：仅记录以自己为 root 的局部拓扑结构；
-* admin 作为全局视图的根拥有全图；
-* 中继 relay 只需要关心**自己以下的子图**；
-* 消息发送基于 **本地注册表+路由表**决定是否下发或上发。
-
----
-
-## 🧭 全流程设计：中继注册与转发机制（v3）
-
----
-
-### 🟢 **启动阶段**
-
-#### 1️⃣ Admin 监听 agent 连接（现有逻辑）
-
-#### 2️⃣ Admin 控制 agentX 成为 relay
-
-* 发送 `MsgStartRelay`：
-
-```go
-type StartRelayPayload struct {
-	ListenAddr string
-	IDStart    int
-	Count      int // 分配空间数量，如 1000
-}
+```
+❯ go run cmd/admin/main.go
+2025/07/04 16:12:28 [+] Admin starting...
+(admin) >> 2025/07/04 16:12:28 [+] Listening on :9999
+2025/07/04 16:12:30 [+] New connection from 127.0.0.1:44456
+2025/07/04 16:12:30 [+] Registered agent ID 0 - doraemon@xxx (linux)
+(admin) >> topo
+[+] Node Topology:
+|- Node[0] doraemon@xxx (linux)
+(admin) >> startrelay 0 9998
+[+] Sent startrelay to node 0, range = [1 ~ 999]
+(admin) >> 2025/07/04 16:13:02 [Relay Ready] Node -1 (:9998) is now acting as relay 
+(admin) >> 2025/07/04 16:13:07 [+] Registered relayed node ID 1 under parent 0
+(admin) >> topo
+[+] Node Topology:
+|- Node[0] doraemon@xxx (linux)
+  |- Node[1] doraemon@xxx (linux)
+(admin) >> 
 ```
 
-* agentX 记录其编号空间 `IDPool = [IDStart, IDStart+Count-1]`
+
+- admin
+![节点拓扑](./assets/topology_admin.png)
+- agent0(relay)
+![](./assets/topology_agent0.png)
+- agent1
+![](./assets/topology_agent1.png)
 
 ---
 
-### 🟢 **relay 启动监听器并创建本地结构**
+### Shell 执行与交互
 
-agentX 调用：
+```
+(admin) >> shell 1
+[+] Shell started. Type commands (type 'exit' to quit):
+remote$ ls
+admin  agent  upload
+```
+![alt text](image.png)
 
-```go
-StartRelayListener(addr string, selfID int, registry *node.Registry, topo *node.NodeGraph, idRange IDAllocator)
+📷 示例插图：
+![交互式 shell](./assets/shell.png)
+
+---
+
+### Forward 转发成功使用 SSH 登录
+
+📷 示例插图：
+![forward ssh](./assets/forward-ssh.png)
+
+---
+
+### list/stopforward 控制指令示例
+
+```
+(admin) >> listforward
+Active forward connections:
+  f5bd3c79-f2ba-4aa2-9b90-885f4a6bfd83 → 127.0.0.1:22
+
+(admin) >> stopforward f5bd3c79-f2ba-4aa2-9b90-885f4a6bfd83
+[+] ForwardConn f5bd3c79-f2ba-4aa2-9b90-885f4a6bfd83 stopped
 ```
 
-> `IDAllocator` 维护分配状态。
+📷 示例插图：
+![转发管理](./assets/forward-control.png)
 
 ---
 
-### 🟢 **新的 agentY 连接 relayX**
+## 🧱 系统架构图
 
-relayX：
+### 1、总架构图
 
-1. 读取 handshake；
-2. 为其分配一个可用 ID：Y ∈ IDPool；
-3. 构建 `node.Node{ID: Y}`；
-4. 注册进本地 `registry` 与 `topo.SetParent(Y, X)`；
-5. 使用 `MsgRelayRegister` 报告 admin：
+```mermaid
+graph LR
+    Admin["cmd/admin/main.go"]
+    Agent["cmd/agent/main.go"]
+    Network["core/network"]
+    Protocol["core/protocol"]
+    Node["core/node"]
+    Common["core/common"]
+    Crypto["core/crypto (placeholder)"]
 
-```go
-type RelayRegisterPayload struct {
-	ParentID int
-	Node     node.Node
-}
+    Admin --> Network
+    Agent --> Network
+    Network --> Protocol
+    Protocol --> Node
+    Protocol --> Common
+    Protocol --> Crypto
+    Network --> Node
+
+```
+
+### 2、admin程序模块调用关系
+```mermaid
+graph TD
+    A1[main.go] --> A2[protocol.StartConsole]
+    A1 --> A3[network.StartListener]
+    A3 --> A4[network.handleConnection]
+    A4 --> A5[network.handleAgentMessages]
+    A5 --> A6[protocol dispatch by Msg.Type]
+    A2 --> A7[protocol.HandleCommand]
+    A7 --> A8[protocol.HandleShell]
+    A7 --> A13[protocol.HandleRelay]
+    A7 --> A9[protocol.HandleUpload]
+    A7 --> A10[protocol.HandleDownload]
+    A7 --> A11[protocol.HandleForward]
+    A7 --> A12[protocol.HandleBackward]
+```
+
+### 3、relay功能执行流程图
+```mermaid
+sequenceDiagram
+    participant Admin
+    participant Relay0
+    participant Agent1
+
+    Admin->>Relay0: MsgStartRelay（启动中继监听）
+    Relay0->>Relay0: StartRelayListener(":port")
+    Relay0->>Admin: MsgRelayReady
+
+    Agent1->>Relay0: MsgHandshake
+    Relay0->>Agent1: 分配 ID + 注册
+    Relay0->>Admin: MsgRelayRegister (封装 RelayPacket)
+
+    Admin->>Relay0: MsgRelayAck (封装 RelayPacket)
+    Relay0->>Agent1: RelayAck
+
+    Note over Admin,Agent1: 此后所有 Msg 都通过 RelayPacket 路由
+
+    Admin->>Relay0: RelayPacket{DestID=1, Data=MsgForwardStart}
+    Relay0->>Agent1: MsgForwardStart
+
+    Agent1->>Relay0: MsgForwardData
+    Relay0->>Admin: RelayPacket{DestID=1, Data=MsgForwardData}
+
+```
+
+### 4、forward功能执行流程图
+```mermaid
+graph LR
+    A1[Admin: StartPortForward] --> A2[net.Listen local_port]
+    A2 --> A3[ln.Accept]
+    A3 --> A4[Send MsgForwardStart to Agent]
+    A4 --> A5[Agent net.Dial target]
+    A5 --> A6[Agent read from target]
+    A6 --> A7[Agent send MsgForwardData]
+    A7 --> A8[Admin relay to conn.Write]
+    A8 --> A9[Optionally: MsgForwardStop]
+```
+### 5、backward功能执行流程图
+```mermaid
+graph LR
+    B1[Admin: handleBackward] --> B2[Agent listen on :port]
+    B2 --> B3[Admin connects to :port]
+    B3 --> B4[Agent sends MsgBackwardStart]
+    B4 --> B5[Admin connects to target]
+    B5 --> B6[Agent reads and sends MsgBackwardData]
+    B6 --> B7[Admin writes to target conn]
 ```
 
 ---
 
-### 🟢 **Admin 注册新节点 Y**
-
-* admin 使用 `registry.Add()`、`topo.SetParent(Y, X)`；
-* 回复 relayX `MsgRelayAck{Success: true}`。
-
----
-
-### 🟢 **后续转发全部通过统一 RelayPacket**
-
-```go
-type RelayPacket struct {
-	DestID int
-	Data   []byte // 嵌套 Message
-}
+##  项目结构（简略）
 ```
-
-中继 relay 路由逻辑：
-
-* 若 `DestID ∈ 本地 registry`：直发；
-* 若不是：找本地 topo 中哪个子 relay 拥有该节点 → 转发；
-* 找不到：返回错误。
-
----
-
-## ✅ Relay 本地结构布局建议
-
-```go
-type RelayContext struct {
-	SelfID     int
-	Registry   *node.Registry
-	Topology   *node.NodeGraph
-	IDAllocator *IDPoolAllocator
-	Upstream    net.Conn // 与 admin 的连接
-}
+.
+├── assets/                          # 静态资源目录（用于README展示）
+│
+├── cmd/                             # 应用程序入口目录
+│   ├── admin/                       # 控制端 Admin 程序
+│   │   └── main.go                  # 启动控制台 + 监听 agent 连接
+│   └── agent/                       # 被控端 Agent 程序
+│       └── main.go                  # 启动并连接到 admin，注册身份
+│
+├── core/                            # 项目核心功能模块
+│   ├── common/                      # 公共工具与配置模块
+│   │   ├── config.go                # （预留）配置加载逻辑
+│   │   ├── id_allocator.go          # Relay 子节点 ID 分配器
+│   │   └── logger.go                # （预留）日志统一处理
+│
+│   ├── network/                     # 网络连接与协议调度模块
+│   │   ├── connection.go            # Admin 端连接接入与消息分发
+│   │   ├── dispatcher.go            # Agent 端消息分发与执行处理
+│   │   ├── relay.go                 # Relay 中继节点监听与转发处理
+│   │   └── utils.go                 # 通用辅助函数（如字节转整数）
+│
+│   ├── node/                        # 节点管理与拓扑结构维护模块
+│   │   ├── registry.go              # 节点注册/查找/移除（包含 PrintTopology）
+│   │   └── topology.go              # 多级 Relay 节点拓扑结构图维护
+│
+│   └── protocol/                    # 协议定义与命令处理逻辑模块
+│       ├── backward.go              # backward 模式（agent → admin）传输实现
+│       ├── command.go               # 控制台命令处理（如 upload、topo、shell）
+│       ├── file_transfer.go         # 下载文件的文件接收器（download）
+│       ├── forward.go               # forward 模式（admin → agent）传输实现
+│       ├── message.go               # 协议消息结构与类型定义
+│       └── ui.go                    # 控制台提示符打印逻辑
+│
+├── pkg/                             # 外部扩展/第三方封装代码目录（预留）
+│
+├── go.mod                           # Go 模块定义与依赖声明
+├── go.sum                           # Go 模块依赖版本校验文件
+│
+├── README.md                        # 📘 项目说明文档
+└── Report.md                        # 📄 项目设计与阶段性报告（课设/实验用）
 ```
+---
+
+## 📦 依赖要求
+
+* Go 1.20+
+* 仅使用标准库 + `github.com/google/uuid` + `github.com/creack/pty v1.1.24`
+
+
 
 ---
 
-## 📊 逻辑关系图（结构树）
+## ✅ 下一步可拓展方向
 
-```
-Admin:
-  Registry: [1000, 1001, 1002, ...]
-  Topology:
-    1000
-    ├── 1001
-    └── 1002
-
-Relay (ID=1000):
-  Registry: [1001, 1002]
-  Topology:
-    1000
-    ├── 1001
-    └── 1002
-```
+* 支持 relay 子节点 backward；
+* 支持文件目录操作；
+* 支持 agent 端启动服务自动上线；
+* 支持 Web UI 控制台（未来版本）；
+* 支持 Debug log 动态开关；
 
 ---
 
-## ✅ 接下来可进入的编码工作子任务：
-
-| 子任务                                                            | 描述                                                         |
-| -------------------------------------------------------------- | ---------------------------------------------------------- |
-| 🧱 定义协议结构体                                                     | `StartRelayPayload`、`RelayRegisterPayload`、`RelayPacket` 等 |
-| 🔧 编写 relay ID 分配器                                             | 简单的 `IDAllocator`，支持 get/free                              |
-| 🚀 实现 `StartRelayListener()`                                   | 支持本地结构注册，回报 admin                                          |
-| 🔁 实现 `HandleRelayConnection()` 和 `HandleRelayAgentMessages()` | 接入与处理                                                      |
-| ↕️ 实现 `HandleRelayPacket()`                                    | 透明转发                                                       |
-| 📤 上报逻辑                                                        | relay 向 admin 报告新节点                                        |
-| 📥 admin handler                                               | 处理 relay 注册消息、构建全局拓扑                                       |
-
----
-
-你是否希望我 **从结构体 + MessageType 开始逐个生成完整代码**，还是你希望我先出整体目录结构或先实现某一部分（如 ID allocator）？我们可以按模块节奏推进。
