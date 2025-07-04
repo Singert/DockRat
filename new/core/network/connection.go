@@ -243,7 +243,7 @@ func handleAgentMessages(n *node.Node, registry *node.Registry) {
 				protocol.PrintPrompt()
 				return
 			}
-			log.Printf("[admin] RelayPacket received: dest=%d, data.len=%d", pkt.DestID, len(pkt.Data))
+			//log.Printf("[admin] RelayPacket received: dest=%d, data.len=%d", pkt.DestID, len(pkt.Data))
 			// ✅ 特殊情况：目标是 admin 本人（DestID == -1）
 			if pkt.DestID == -1 {
 				innerMsg, err := protocol.DecodeMessage(pkt.Data)
@@ -300,7 +300,6 @@ func handleAgentMessages(n *node.Node, registry *node.Registry) {
 				protocol.PrintPrompt()
 			case protocol.MsgShell:
 				fmt.Print(string(innerMsg.Payload))
-				protocol.PrintPrompt()
 			case protocol.MsgFileChunk:
 				fmt.Println("[+] Received file chunk from node", pkt.DestID)
 				var chunk protocol.FileChunk

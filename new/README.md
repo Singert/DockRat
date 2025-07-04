@@ -9,33 +9,33 @@
 
 DockRat 是一个支持多级 relay 拓扑结构的远程控制平台，采用 Go 语言开发，具备轻量、模块化、高可控等特性，适用于安全研究、远程维护、远程执行等场景。
 
-> ✅ 支持直连与 relay 模式
-> ✅ 支持端口转发、shell、文件传输、反向连接
-> ✅ 控制命令清晰易用
-> ✅ 拓扑结构可视化
+>  支持直连与 relay 模式
+>  支持端口转发、shell、文件传输、反向连接
+>  控制命令清晰易用
+>  拓扑结构可视化
 
 ---
 
-## 🔧 当前支持功能（截至 2025-07）
+## 一、 当前支持功能（截至 2025-07）
 
-### ✅ 节点管理
+### 1 节点管理
 
 * 支持多节点注册（直连 / relay 模式）
 * `startrelay <id> <port>`：启动 relay 功能，子节点从此连接
 * `topo`：可视化打印当前节点拓扑结构
 
-### ✅ Shell 功能
+### 2 Shell 功能
 
 * `shell <id>`：启动交互式 shell
 * 保持持久上下文（支持 cd / export 等）
 * 支持多层 relay shell 透传
 
-### ✅ 文件上传下载
+### 3 文件上传下载
 
 * `upload <id> <local> <remote>`：上传文件
 * `download <id> <remote> <local>`：下载文件（支持大文件分片）
 
-### ✅ 端口转发
+### 4 端口转发
 
 * **正向转发（forward）**
   `forward <id> <local_port> <target_host:port>`
@@ -45,26 +45,26 @@ DockRat 是一个支持多级 relay 拓扑结构的远程控制平台，采用 G
   `backward <id> <agent_listen_port> <admin_target>`
   agent 监听端口，admin 主动连接后转发至目标服务
 
-* ✅ 已支持：
+*  已支持：
 
-  * relay 子节点 forward
+  * relay 子节点 forward + backward(relay子节点backward功能不稳定)
   * 直连节点 forward + backward
 
-* ❌ 未支持：relay 子节点 backward（已知问题）
-
-### ✅ 连接控制指令
-
-* `stopforward <connID>`：关闭指定 forward 通道
-* `stopbackward <connID>`：关闭指定 backward 通道
-* `listforward`：查看当前 forward 通道状态
-* `listbackward`：查看当前 backward 通道状态
-
----
-
-## 🖥️ 实际运行截图
 
 
-### 节点注册与拓扑展示
+### 5 连接控制指令
+
+* `forward_stop <connID>`：关闭指定 forward 通道
+* `backward_stop <connID>`：关闭指定 backward 通道
+* `list_forward`：查看当前 forward 通道状态
+* `list_backward`：查看当前 backward 通道状态
+
+
+## 二、 实际运行截图
+- 运行环境：Go 1.20+，Linux x86_64
+- 节点说明：均位于本机的不同目录下，可以在shell N时看到明显差异
+
+### 1、节点注册与拓扑展示
 
 ```
 ❯ go run cmd/admin/main.go
@@ -96,7 +96,7 @@ DockRat 是一个支持多级 relay 拓扑结构的远程控制平台，采用 G
 
 ---
 
-### Shell 执行与交互
+### 2、Shell 执行与交互
 
 ```
 (admin) >> shell 1
@@ -104,37 +104,50 @@ DockRat 是一个支持多级 relay 拓扑结构的远程控制平台，采用 G
 remote$ ls
 admin  agent  upload
 ```
-![alt text](image.png)
 
-📷 示例插图：
-![交互式 shell](./assets/shell.png)
+![交互式 shell](./assets/shell1.png)
 
 ---
 
-### Forward 转发成功使用 SSH 登录
+### 3、Forward 转发成功使用 SSH 登录
+测试admin为悬挂在agent0上的agent1开启22-ssh端口的forward指令
 
-📷 示例插图：
-![forward ssh](./assets/forward-ssh.png)
 
----
+- admin节点指令
+  ![](./assets/forward_admin.png)
 
-### list/stopforward 控制指令示例
+- agent0节点console
+  ![](./assets/forward_agent0.png)
+- agent0节点console
+  ![](./assets/forward_agent1.png)
+- agent1节点SSH登录成功
+  ![forward ssh](./assets/forward_ssh.png)
 
-```
-(admin) >> listforward
-Active forward connections:
-  f5bd3c79-f2ba-4aa2-9b90-885f4a6bfd83 → 127.0.0.1:22
+### 4、backward 转发成功使用 SSH 登录
+测试admin为悬挂在agent0上的agent1开启22-ssh端口的forward指令
 
-(admin) >> stopforward f5bd3c79-f2ba-4aa2-9b90-885f4a6bfd83
-[+] ForwardConn f5bd3c79-f2ba-4aa2-9b90-885f4a6bfd83 stopped
-```
 
-📷 示例插图：
-![转发管理](./assets/forward-control.png)
+- admin节点指令
+  ![](./assets/backward_admin.png)
 
----
+- agent0节点console
+  ![](./assets/backward_agent0.png)
+- agent0节点console
+  ![](./assets/backward_agent1.png)
+- agent1节点SSH登录成功
+  ![forward ssh](./assets/backward_ssh.png)
 
-## 🧱 系统架构图
+
+### 5 list/stop forward/backward 控制指令,以forward为例
+
+- list_forward
+![](./assets/list_forward.png)
+- forward_stop
+![](./assets/forward_stop.png)
+
+
+
+## 三 系统架构图
 
 ### 1、总架构图
 
@@ -226,9 +239,9 @@ graph LR
     B6 --> B7[Admin writes to target conn]
 ```
 
----
 
-##  项目结构（简略）
+
+## 四 项目结构
 ```
 .
 ├── assets/                          # 静态资源目录（用于README展示）
@@ -271,18 +284,17 @@ graph LR
 ├── README.md                        # 📘 项目说明文档
 └── Report.md                        # 📄 项目设计与阶段性报告（课设/实验用）
 ```
----
 
-## 📦 依赖要求
+## 五、 依赖要求
 
 * Go 1.20+
 * 仅使用标准库 + `github.com/google/uuid` + `github.com/creack/pty v1.1.24`
 
 
 
----
 
-## ✅ 下一步可拓展方向
+
+## 六、 下一步可拓展方向
 
 * 支持 relay 子节点 backward；
 * 支持文件目录操作；
@@ -290,5 +302,63 @@ graph LR
 * 支持 Web UI 控制台（未来版本）；
 * 支持 Debug log 动态开关；
 
----
+## 七、DockRat 在网络安全中的典型应用场景
+
+
+### 1.  **红队渗透测试（Red Team）**
+
+在攻防演练或授权渗透测试中，红队通常需要：
+
+* **从跳板机访问目标内网节点**；
+* **横向移动到多个层级的子网**；
+* **反弹 shell 或控制内网服务**。
+
+> **DockRat 的 relay + backward + forward 特性非常适用于此类需求：**
+
+* `forward`：将 admin 本地端口映射至目标 agent，可以访问目标内网服务（如内网 SSH、数据库等）；
+* `backward`：允许内网 agent 监听端口，将连接反向送回 admin，实现“反弹”控制；
+* `startrelay`：允许一个 agent 作为 relay 中继，支撑多跳连接穿透复杂拓扑。
+
+
+```
+admin$ startrelay 0 9998     // Agent 0 成为 relay
+admin$ backward 2 2222 127.0.0.1:3389
+admin$ forward 3 1080 127.0.0.1:445
+```
+
+
+
+### 2.  **安全工具链构建与协议实验**
+
+该项目支持自定义多种消息类型与转发机制，适用于构建**协议测试平台**或**控制通道原型**。
+
+可用于：
+
+* 演示 TCP 隧道如何构建；
+* 实现 C2（Command & Control）通道原型；
+* 验证 relay 栈中的消息封装与多级透传机制；
+* 测试反向连接可靠性与稳定性。
+
+
+
+### 3.  **内网控制与分布式代理测试**
+
+* 模拟 **僵尸网络通信架构**；
+* 管理多个 agent 节点，发送命令并统一查看回显；
+* 测试数据流量的透明中继、流量追踪能力；
+* 用于开发**自定义分布式转发网关**系统。
+
+
+
+### 4.  **恶意行为研究与蜜罐诱捕**
+
+DockRat 的特性类似于某些真实恶意控制器（如 Cobalt Strike Beacon）：
+
+* 多级 relay；
+* 文件上传/下载；
+* 可动态注入新模块（如未来支持 socks5）；
+
+> 因此也适用于**研究恶意流量特征**、**构建仿真蜜罐环境**。
+
+
 
