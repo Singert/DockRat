@@ -229,3 +229,19 @@ func (r *Registry) Add(node *Node) int {
 
 是否需要我继续帮你实现节点注册与拓扑展示（detail 命令）？这将开启“多节点管理”阶段的第一步。
 
+## forward 命令进一步拓展 
+stopforward	控制台命令终止某个转发
+forwardlist	列出当前所有 forward 连接
+topo -verbose	显示每个 agent 的连接与 relay 路径
+socks5	基于 forward 构建完整 socks5 代理
+自动心跳 / 超时断开	管理连接稳定性
+stopforward / stopbackward 控制命令；
+
+listforward / listbackward 可视化状态；
+
+socks5 通用代理入口；
+
+加密通信（对称加密）？
+====
+对于每一个命令生成一个
+是否需要我现在为你输出完整结构关系图（admin/relay/agent 三端中 MsgForward* 交互流）？这会帮助你理解 forward 全流程。

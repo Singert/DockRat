@@ -26,6 +26,22 @@ const (
 	MsgRelayAck      MessageType = "relay_ack"      // Admin → agentX：注册成功确认
 	MsgRelayError    MessageType = "relay_error"    // Admin → agentX：注册失败说明
 	MsgRelayPacket   MessageType = "relay_packet"   // 任意层级间透明转发消息
+	// Upload
+	MsgUpload    MessageType = "upload"     // Admin → Agent：开始上传文件
+	MsgFileChunk MessageType = "file_chunk" // Admin → Agent：分片内容
+	MsgFileAck   MessageType = "file_ack"   // Agent → Admin：确认收片
+	// Download
+	MsgDownload     MessageType = "download"      // Admin → Agent：请求下载文件
+	MsgDownloadDone MessageType = "download_done" // Agent → Admin：传输完成标志
+	// Forwarding / Port Proxy
+	MsgForwardStart MessageType = "forward_start" // Admin → Agent：请求发起端口连接
+	MsgForwardData  MessageType = "forward_data"  // 双向传输数据（ConnID+Data）
+	MsgForwardStop  MessageType = "forward_stop"  // 任一方主动关闭连接
+	// Backward
+	MsgBackwardStart  MessageType = "backward_start"  // Agent → Admin：有连接接入，请求建立目标连接
+	MsgBackwardData   MessageType = "backward_data"   // Agent ↔ Admin：数据透传
+	MsgBackwardStop   MessageType = "backward_stop"   // 任意一方断开
+	MsgBackwardListen MessageType = "backward_listen" // Admin → Agent：指令其监听端口
 
 )
 
@@ -39,6 +55,20 @@ type HandshakePayload struct {
 	Hostname string `json:"hostname"`
 	Username string `json:"username"`
 	OS       string `json:"os"`
+}
+
+type FileMeta struct {
+	Filename string `json:"filename"`
+	Path     string `json:"path"` // agent 端保存路径
+	Size     int64  `json:"size"`
+}
+type DownloadRequest struct {
+	Path string `json:"path"` // agent 端要下载的路径
+}
+type FileChunk struct {
+	Offset int64  `json:"offset"`
+	Data   []byte `json:"data"`
+	EOF    bool   `json:"eof"`
 }
 
 // 1. 启动 relay 请求（admin → agentX）
@@ -68,10 +98,48 @@ type RelayAckPayload struct {
 	Message string `json:"message,omitempty"` // 可选信息
 }
 
+// ------ forward Payload ------
+
 // 5. 通用转发消息（relay 用于向下或向上传递）
 type RelayPacket struct {
 	DestID int    `json:"dest_id"` // 最终目标节点 ID
 	Data   []byte `json:"data"`    // 原始 Message 的字节流（即 protocol.EncodeMessage(...)）
+}
+
+// MsgForwardStart：建立一个远程连接请求
+type ForwardStartPayload struct {
+	ConnID string `json:"conn_id"` // 唯一连接标识
+	Target string `json:"target"`  // 目标地址（如 192.168.1.100:22）
+}
+
+// MsgForwardData：数据传输
+type ForwardDataPayload struct {
+	ConnID string `json:"conn_id"` // 对应连接
+	Data   []byte `json:"data"`    // 原始数据
+}
+
+// MsgForwardStop：关闭连接
+type ForwardStopPayload struct {
+	ConnID string `json:"conn_id"` // 要关闭的连接
+}
+
+// ------ backward Payload ------
+type BackwardListenPayload struct {
+	ListenPort int    `json:"listen_port"` // agent 端监听端口
+	Target     string `json:"target"`      // admin 本地连接目标，如 127.0.0.1:22
+}
+
+type BackwardStartPayload struct {
+	ConnID string `json:"conn_id"`
+}
+
+type BackwardDataPayload struct {
+	ConnID string `json:"conn_id"`
+	Data   []byte `json:"data"`
+}
+
+type BackwardStopPayload struct {
+	ConnID string `json:"conn_id"`
 }
 
 // EncodeMessage 将Message编码带长度前缀的字节流
