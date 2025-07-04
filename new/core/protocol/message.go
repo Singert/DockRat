@@ -26,7 +26,6 @@ const (
 	MsgRelayAck      MessageType = "relay_ack"      // Admin → agentX：注册成功确认
 	MsgRelayError    MessageType = "relay_error"    // Admin → agentX：注册失败说明
 	MsgRelayPacket   MessageType = "relay_packet"   // 任意层级间透明转发消息
-
 )
 
 // Message 是基本通信结构
@@ -41,34 +40,33 @@ type HandshakePayload struct {
 	OS       string `json:"os"`
 }
 
-// 1. 启动 relay 请求（admin → agentX）
+// 启动 relay 请求（admin → agentX）
 type StartRelayPayload struct {
 	SelfID     int    `json:"self_id"`     // relay 节点自己的 ID
 	ListenAddr string `json:"listen_addr"` // relay 要监听的地址
 	IDStart    int    `json:"id_start"`    // 分配给该 relay 的编号段起始
 	Count      int    `json:"count"`       // 分配数量（默认1000）
-
 }
 
-// 2. relay 启动成功回报（agentX → admin）
+// relay 启动成功回报（agentX → admin）
 type RelayReadyPayload struct {
 	SelfID     int    `json:"self_id"`     // relay 节点自己的 ID
 	ListenAddr string `json:"listen_addr"` // 成功监听的地址
 }
 
-// 3. relay 向 admin 上报子节点注册请求
+// relay 向 admin 上报子节点注册请求
 type RelayRegisterPayload struct {
 	ParentID int       `json:"parent_id"` // relay 的 ID
 	Node     node.Node `json:"node"`      // 新子节点信息
 }
 
-// 4. 注册结果反馈（admin → relay）
+// 注册结果反馈（admin → relay）
 type RelayAckPayload struct {
 	Success bool   `json:"success"`
 	Message string `json:"message,omitempty"` // 可选信息
 }
 
-// 5. 通用转发消息（relay 用于向下或向上传递）
+// 通用转发消息（relay 用于向下或向上传递）
 type RelayPacket struct {
 	DestID int    `json:"dest_id"` // 最终目标节点 ID
 	Data   []byte `json:"data"`    // 原始 Message 的字节流（即 protocol.EncodeMessage(...)）

